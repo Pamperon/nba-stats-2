@@ -123,42 +123,147 @@ def parse_odds(data, catalog, market_label):
     return sorted(rows.values(), key=lambda r: (r["Giocatore"], r["Linea"])), diag
 
 
+ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
+ESPN_WEB = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba"
+
+
+def espn_json(url, **params):
+    # Public ESPN endpoints: no account, key or OddsPapi request involved.
+    response = requests.get(url, params=params, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; NBAStats2/2.0)",
+        "Accept": "application/json",
+    }, timeout=(8, 22))
+    response.raise_for_status()
+    return response.json()
+
+
+def normalized_name(name):
+    import unicodedata
+    name = unicodedata.normalize("NFKD", str(name))
+    name = "".join(c for c in name if not unicodedata.combining(c))
+    parts = [p.strip() for p in name.split(",")]
+    if len(parts) == 2:
+        name = parts[1] + " " + parts[0]
+    return re.sub(r"[^a-z0-9]", "", name.casefold())
+
+
 @st.cache_data(ttl=7 * 86400, show_spinner=False)
-def nba_player_directory():
-    from nba_api.stats.static import players
-    return players.get_players()
+def espn_teams():
+    data = espn_json(f"{ESPN_SITE}/teams", limit=50)
+    return (data.get("sports") or [{}])[0].get("leagues", [{}])[0].get("teams", [])
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner="Recupero statistiche ufficiali NBA…")
-def nba_game_log(player_id, season):
-    from nba_api.stats.endpoints import playergamelog
-    # A timeout can be transient. Retry once with a slightly longer timeout.
-    # Both requests go directly to stats.nba.com; neither uses OddsPapi.
-    for attempt, timeout_seconds in enumerate((15, 35), start=1):
-        try:
-            return playergamelog.PlayerGameLog(
-                player_id=player_id,
-                season=season,
-                season_type_all_star="Regular Season",
-                timeout=timeout_seconds,
-            ).get_data_frames()[0]
-        except requests.exceptions.Timeout:
-            logger.warning("NBA game log timed out: attempt=%s timeout=%ss", attempt, timeout_seconds)
-            if attempt == 2:
-                raise
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def espn_roster(team_id, end_year):
+    return espn_json(f"{ESPN_SITE}/teams/{team_id}/roster", season=end_year)
 
 
-def match_nba_player(odds_name, directory):
-    # OddsPapi: "Cunningham, Cade"; nba_api: "Cade Cunningham".
-    parts = [p.strip() for p in odds_name.split(",")]
-    normalized = " ".join(reversed(parts)) if len(parts) == 2 else odds_name
-    norm = lambda s: re.sub(r"[^a-z0-9]", "", s.casefold())
-    matches = [p for p in directory if norm(p["full_name"]) == norm(normalized)]
-    return matches[0] if len(matches) == 1 else None
+def roster_athletes(payload):
+    athletes = payload.get("athletes") or []
+    for group in athletes:
+        if not isinstance(group, dict):
+            continue
+        if "items" in group:
+            for item in group.get("items") or []:
+                if isinstance(item, dict):
+                    yield item.get("athlete", item)
+        elif "id" in group:
+            yield group.get("athlete", group)
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def espn_search_player(name):
+    # Search fallback when ESPN rosters are missing a recently traded player.
+    data = espn_json("https://site.web.api.espn.com/apis/search/v2", query=name, limit=30)
+    found = []
+    def visit(node):
+        if isinstance(node, dict):
+            if normalized_name(node.get("displayName") or node.get("fullName") or node.get("name", "")) == normalized_name(name):
+                ident = node.get("id") or str(node.get("uid", "")).split("a:")[-1]
+                if str(ident).isdigit():
+                    found.append({"id": str(ident), "full_name": name})
+            for value in node.values():
+                if isinstance(value, (list, dict)):
+                    visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+    visit(data)
+    unique = {x["id"]: x for x in found}
+    return next(iter(unique.values())) if len(unique) == 1 else None
+
+
+def match_espn_player(name, home_team, away_team, end_year):
+    target = normalized_name(name)
+    teams = espn_teams()
+    ids = []
+    for entry in teams:
+        team = entry.get("team", entry)
+        candidates = (team.get("displayName"), team.get("name"), team.get("shortDisplayName"))
+        if any(normalized_name(t) in (normalized_name(home_team), normalized_name(away_team)) for t in candidates if t):
+            ids.append(str(team["id"]))
+    for team_id in ids:
+        roster = espn_roster(team_id, end_year)
+        for athlete in roster_athletes(roster):
+            if normalized_name(athlete.get("displayName") or athlete.get("fullName") or "") == target:
+                return {"id": str(athlete["id"]), "full_name": athlete.get("displayName") or athlete.get("fullName")}
+    return espn_search_player(name)
+
+
+def espn_log_to_frame(data):
+    labels = [str(x).upper() for x in data.get("labels", [])]
+    if not all(x in labels for x in ("PTS", "REB", "AST")):
+        raise ValueError("ESPN: mancano le colonne PTS/REB/AST nello storico")
+    metadata = data.get("events") or {}
+    if isinstance(metadata, list):
+        metadata = {str(e.get("id")): e for e in metadata if isinstance(e, dict)}
+    rows = []
+    for season_type in data.get("seasonTypes") or []:
+        type_id = str(season_type.get("id") or season_type.get("type") or "")
+        type_name = str(season_type.get("displayName") or season_type.get("name") or "").lower()
+        if type_id and type_id != "2" and "regular" not in type_name:
+            continue
+        if not type_id and "regular" not in type_name:
+            continue
+        for category in season_type.get("categories") or []:
+            if str(category.get("type", "")).lower() == "total":
+                continue
+            for event in category.get("events") or []:
+                if not isinstance(event, dict):
+                    continue
+                values = event.get("stats") or []
+                if not isinstance(values, list) or len(values) != len(labels):
+                    continue
+                event_id = str(event.get("eventId") or event.get("id") or "")
+                info = metadata.get(event_id, {})
+                if not isinstance(info, dict):
+                    info = {}
+                opponent = info.get("opponent") or {}
+                opp = opponent.get("abbreviation") or opponent.get("displayName") or "?"
+                rows.append({
+                    "GAME_ID": event_id,
+                    "GAME_DATE": info.get("date") or event.get("date"),
+                    "MATCHUP": f"{'@' if str(info.get('atVs', '')).strip() == '@' else 'vs'} {opp}",
+                    "MIN": values[labels.index("MIN")] if "MIN" in labels else None,
+                    "PTS": values[labels.index("PTS")],
+                    "REB": values[labels.index("REB")],
+                    "AST": values[labels.index("AST")],
+                })
+    frame = pd.DataFrame(rows, columns=["GAME_ID", "GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"])
+    if not frame.empty:
+        frame = frame.drop_duplicates(subset=["GAME_ID"], keep="first")
+    return frame
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Recupero storico ESPN…")
+def espn_game_log(athlete_id, season):
+    end_year = int(season.split("-")[0]) + 1
+    payload = espn_json(f"{ESPN_WEB}/athletes/{athlete_id}/gamelog", season=end_year)
+    return espn_log_to_frame(payload)
 
 
 st.title("🏀 NBA STATS 2.0")
-st.caption("Quote Bet365 Italia tramite OddsPapi · Statistiche giocatori dal sito NBA ufficiale")
+st.caption("Quote Bet365 Italia tramite OddsPapi · Statistiche NBA da ESPN (fonte gratuita)")
 st.info("Le quote alternative segnalate come inattive dall'API sono visibili per consultazione, ma la loro disponibilità va verificata su Bet365.")
 if not API_KEY:
     st.error("Configura ODDSPAPI_API_KEY nei Secrets di Streamlit.")
@@ -222,22 +327,21 @@ with st.expander("🔎 Diagnostica mercati (nessuna richiesta OddsPapi aggiuntiv
     st.caption("Dati ricavati dalla risposta OddsPapi già caricata.")
 
 st.divider()
-st.subheader("📈 Statistiche ufficiali NBA — prima integrazione")
-st.caption("Le statistiche utilizzano nba_api e non consumano richieste OddsPapi. In caso di timeout, viene effettuato un solo tentativo aggiuntivo.")
+st.subheader("📈 Statistiche NBA — ESPN")
+st.caption("Storico delle partite tramite ESPN, senza API a pagamento e senza richieste OddsPapi aggiuntive. Solo regular season.")
 season = st.selectbox("Stagione NBA", ["2026-27", "2025-26", "2024-25"])
 if st.button("📊 Carica statistiche NBA del giocatore"):
     st.session_state.stats_selection = (player_name, season)
 if st.session_state.get("stats_selection") == (player_name, season):
-    diagnostic_stage = "Caricamento anagrafica giocatori NBA"
+    diagnostic_stage = "Identificazione giocatore su ESPN"
     try:
-        directory = nba_player_directory()
-        diagnostic_stage = "Abbinamento del nome del giocatore"
-        nba_player = match_nba_player(player_name, directory)
+        fixture = options[choice]
+        nba_player = match_espn_player(player_name, fixture.get("participant1Name", ""), fixture.get("participant2Name", ""), int(season[:4]) + 1)
         if not nba_player:
-            st.warning("Nome giocatore non abbinato automaticamente all'anagrafica NBA. Non sono stati utilizzati dati di un altro giocatore.")
+            st.warning("Giocatore non trovato con certezza negli elenchi ESPN. Nessuna statistica attribuita per approssimazione.")
         else:
-            diagnostic_stage = "Recupero storico partite da stats.nba.com"
-            log = nba_game_log(nba_player["id"], season)
+            diagnostic_stage = "Recupero storico partite da ESPN"
+            log = espn_game_log(nba_player["id"], season)
             diagnostic_stage = "Elaborazione e visualizzazione statistiche"
             if log.empty:
                 st.info("Nessuna partita di regular season disponibile per questo giocatore e questa stagione.")
@@ -273,7 +377,7 @@ if st.session_state.get("stats_selection") == (player_name, season):
             st.json({"Fase": diagnostic_stage, "Tipo errore": error_type,
                      "Stato HTTP": status if status is not None else "Non disponibile",
                      "Giocatore": player_name, "Stagione": season,
-                     "Tentativi previsti in caso di timeout": 2})
+                     "Fonte": "ESPN (gratuita)"})
             st.caption("Questi dettagli sono ricavati dall'errore già avvenuto: non viene eseguito alcun nuovo test di rete. Non condividere eventuali credenziali presenti in altri log.")
 
-st.caption("Quote: cache 24 ore · Calendario: 24 ore · Catalogo: 7 giorni · Statistiche NBA: cache 6 ore. La cache può svuotarsi ai riavvii.")
+st.caption("Quote: cache 24 ore · Calendario: 24 ore · Catalogo: 7 giorni · Statistiche ESPN: cache 6 ore. La cache può svuotarsi ai riavvii.")
