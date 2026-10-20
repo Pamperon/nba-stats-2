@@ -441,9 +441,13 @@ def espn_event_competition_type(event_id):
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Classificazione partite ESPN…")
 def espn_classified_game_log(athlete_id, season, team_id):
-    """Use event metadata to distinguish regular season from playoffs for any player."""
+    """Classify using ESPN game-log groups first, then independent evidence.
+
+    An unclassified game is never silently called a playoff game.
+    """
     end_year = int(season[:4]) + 1
-    raw = []
+    frames = []
+    membership = {2: set(), 3: set()}
     for requested_type in (None, 3):
         params = {"season": end_year}
         if requested_type is not None:
@@ -451,27 +455,48 @@ def espn_classified_game_log(athlete_id, season, team_id):
         payload = espn_json(f"{ESPN_WEB}/athletes/{athlete_id}/gamelog", **params)
         frame = espn_log_to_frame(payload)
         if not frame.empty:
-            raw.append(frame)
+            frames.append(frame)
+            if requested_type in (2, 3):
+                membership[requested_type].update(frame["GAME_ID"].astype(str))
     columns = ["GAME_ID", "SEASON_TYPE", "GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"]
-    if not raw:
+    if not frames:
         return pd.DataFrame(columns=columns)
-    games = pd.concat(raw, ignore_index=True).drop_duplicates(subset=["GAME_ID"], keep="first").reset_index(drop=True)
-    # The roster team may be the current team; for players who moved teams,
-    # game summaries can resolve event IDs missing from this team's schedule.
-    known_types = espn_schedule_competition_ids(team_id, end_year) if team_id else {}
-    unresolved = [event_id for event_id in games["GAME_ID"].astype(str) if event_id not in known_types]
-    for event_id in unresolved:
+
+    # Prefer explicit season type attached to the individual log row.
+    games = pd.concat(frames, ignore_index=True)
+    explicit = {}
+    for _, row in games.iterrows():
+        event_id = str(row["GAME_ID"])
+        kind = row["SEASON_TYPE"]
+        if pd.notna(kind) and int(kind) in (2, 3):
+            explicit.setdefault(event_id, set()).add(int(kind))
+    games = games.drop_duplicates(subset=["GAME_ID"], keep="first").reset_index(drop=True)
+    known = {event_id: next(iter(types)) for event_id, types in explicit.items() if len(types) == 1}
+
+    # Schedules provide corroboration when the game-log group lacks type info.
+    try:
+        schedule_types = espn_schedule_competition_ids(team_id, end_year) if team_id else {}
+    except (requests.RequestException, ValueError, TypeError):
+        schedule_types = {}
+    for event_id, kind in schedule_types.items():
+        if event_id not in known and kind in (2, 3):
+            known[event_id] = kind
+
+    # Last resort: ask for an event summary, but only for unresolved games.
+    for event_id in games["GAME_ID"].astype(str):
+        if event_id in known:
+            continue
         try:
-            found = espn_event_competition_type(event_id)
+            kind = espn_event_competition_type(event_id)
         except (requests.RequestException, ValueError, TypeError):
-            found = None
-        if found in (2, 3):
-            known_types[event_id] = found
-    games["SEASON_TYPE"] = games["GAME_ID"].astype(str).map(known_types)
-    missing = int(games["SEASON_TYPE"].isna().sum())
-    if missing:
-        raise ValueError(f"ESPN non consente di classificare {missing} partite su {len(games)}: impossibile distinguere regular season e playoff senza inventare dati.")
-    games["SEASON_TYPE"] = games["SEASON_TYPE"].astype(int)
+            kind = None
+        if kind in (2, 3):
+            known[event_id] = kind
+
+    games["SEASON_TYPE"] = games["GAME_ID"].astype(str).map(known)
+    # Do not raise for unknown classification: expose the uncertainty and exclude
+    # those games from mode-specific analyses to avoid false Over/Under results.
+    games.attrs["unclassified"] = int(games["SEASON_TYPE"].isna().sum())
     return games
 
 
@@ -482,7 +507,7 @@ def selected_game_log(athlete_id, season, mode, team_id=None):
     if mode == "Playoff":
         return games.loc[games["SEASON_TYPE"] == 3].copy()
     if mode == "Regular season + Playoff":
-        return games.copy()
+        return games.loc[games["SEASON_TYPE"].isin([2, 3])].copy()
     raise ValueError("Modalità competizione non riconosciuta")
 
 
@@ -606,6 +631,9 @@ if st.session_state.get("stats_selection") == (player_name, season, competition_
         else:
             diagnostic_stage = "Recupero storico partite da ESPN"
             log = selected_game_log(nba_player["id"], season, competition_mode, nba_player.get("team_id"))
+            uncertain_games = espn_classified_game_log(nba_player["id"], season, nba_player.get("team_id")).attrs.get("unclassified", 0)
+            if uncertain_games:
+                st.warning(f"ESPN non permette di identificare la competizione di {uncertain_games} partite. Queste partite sono escluse dall’analisi per evitare statistiche errate.")
             diagnostic_stage = "Elaborazione e visualizzazione statistiche"
             if log.empty:
                 st.info(f"Nessuna partita disponibile in modalità {competition_mode} per questo giocatore e questa stagione.")
