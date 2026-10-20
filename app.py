@@ -527,44 +527,23 @@ def selected_game_log(athlete_id, season, mode, team_id=None):
 
 
 def auto_filter_suspicious_lines(player_rows):
-    """Keep a coherent sequence anchored to the main O/U quote when present.
+    """Remove a lower threshold if its Over price exceeds the next higher Over.
 
-    Over prices for increasing thresholds cannot decrease. Inconsistent
-    selections are excluded, not silently repriced. This cannot establish
-    whether a monotonic selection is currently visible on Bet365.
+    Compare adjacent Over quotes, repeating after each removal. Preserve Under-only
+    rows. A monotonic feed is not proof that Bet365 currently offers the quote.
     """
     ordered = sorted(player_rows, key=lambda r: r["Linea"])
-    priced = [r for r in ordered if isinstance(r.get("Over"), (int, float))]
-    if len(priced) < 2:
-        return ordered, []
-    anchors = [r for r in priced if r.get("Tipo") == "Over/Under" and
-               isinstance(r.get("Under"), (int, float))]
-    if not anchors:
-        anchors = [r for r in priced if r.get("Principale")]
-    if not anchors:
-        # Without a reliable main line, don't guess which side of an
-        # inversion is stale. Leave the selection for manual verification.
-        return ordered, []
-    anchor = anchors[0]
-    accepted_ids = {id(anchor)}
-    anchor_idx = priced.index(anchor)
-    last = anchor["Over"]
-    for r in reversed(priced[:anchor_idx]):
-        # Lower threshold => strictly cheaper Over, within quote precision.
-        if r["Over"] < last - 0.005:
-            accepted_ids.add(id(r))
-            last = r["Over"]
-    last = anchor["Over"]
-    for r in priced[anchor_idx + 1:]:
-        # Higher threshold => strictly more expensive Over.
-        if r["Over"] > last + 0.005:
-            accepted_ids.add(id(r))
-            last = r["Over"]
-    excluded = [r for r in priced if id(r) not in accepted_ids]
-    # Rows without an Over quote can still have a valid Under price.
-    kept = [r for r in ordered if id(r) in accepted_ids or r not in priced]
+    kept = list(ordered)
+    excluded = []
+    while True:
+        over_rows = [r for r in kept if isinstance(r.get("Over"), (int, float))]
+        bad = next((prev for prev, following in zip(over_rows, over_rows[1:])
+                    if prev["Over"] > following["Over"] + 0.005), None)
+        if bad is None:
+            break
+        kept.remove(bad)
+        excluded.append(bad)
     return kept, excluded
-
 
 
 def finder_estimate_probability(log, stat, line, side):
@@ -696,7 +675,7 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
                     for row in excluded:
                         filter_audit.append({"Partita": match_name, "Giocatore": player_name,
                                              "Mercato": STATS[market_label], "Linea": row["Linea"],
-                                             "Motivo": "Quota Over non monotona rispetto alla linea principale"})
+                                             "Motivo": "Quota Over della linea inferiore maggiore della linea successiva"})
                     for row in filtered:
                         if not bet365_line_allowed(row, STATS[market_label]):
                             filter_audit.append({"Partita": match_name, "Giocatore": player_name,
@@ -887,13 +866,12 @@ player_name = st.selectbox("🏀 Giocatore", sorted({r["Giocatore"] for r in row
 player_rows = [r for r in rows if r["Giocatore"] == player_name]
 st.subheader(f"{player_name} · {market_label}")
 st.caption("Le soglie '+' mostrano soltanto la quota Over (20+ = Over 19,5). Nessuna quota Under viene inventata.")
-st.caption("Il filtro automatico segnala anomalie nelle quote, ma non garantisce che ogni linea sia realmente presente su Bet365.")
-automatic_filter = st.checkbox("Filtro automatico linee sospette", value=True,
-                               help="Confronta ogni Over con la quota principale: a soglia maggiore deve corrispondere una quota maggiore. Non verifica in tempo reale il sito Bet365.")
-if automatic_filter:
-    player_rows, excluded_rows = auto_filter_suspicious_lines(player_rows)
-    if excluded_rows:
-        st.caption(f"Filtro automatico: escluse {len(excluded_rows)} linee con quote Over incoerenti rispetto alla linea principale. Puoi disattivarlo per rivederle.")
+st.caption("Controllo automatico attivo: se una soglia inferiore ha una quota Over maggiore della successiva, viene esclusa. La disponibilità su Bet365 non è garantita.")
+player_rows, excluded_rows = auto_filter_suspicious_lines(player_rows)
+if excluded_rows:
+    st.caption(f"Escluse automaticamente {len(excluded_rows)} linee con quote Over incoerenti.")
+    with st.expander("🔎 Linee escluse per quote incoerenti"):
+        st.dataframe(pd.DataFrame(excluded_rows)[["Linea", "Over", "Under", "Tipo"]], hide_index=True, width="stretch")
 out_of_schema = [r for r in player_rows if not bet365_line_allowed(r, STATS[market_label])]
 player_rows = [r for r in player_rows if bet365_line_allowed(r, STATS[market_label])]
 if out_of_schema:
@@ -901,12 +879,8 @@ if out_of_schema:
         st.dataframe(pd.DataFrame(out_of_schema)[["Giocatore", "Linea", "Over", "Under", "Tipo"]],
                      hide_index=True, width="stretch")
         st.caption("Le soglie principali Over/Under rimangono visibili anche se diverse dalle soglie alternative.")
-min_line_enabled = st.checkbox("Imposta manualmente la prima linea disponibile", value=False)
-if min_line_enabled:
-    min_line = st.number_input("Prima linea disponibile su Bet365", min_value=0.5, max_value=200.5, value=14.5, step=1.0, format="%.1f")
-    player_rows = [r for r in player_rows if r["Linea"] >= min_line]
 if not player_rows:
-    st.warning("Nessuna linea rimasta dopo i filtri. Disattivali o abbassa la soglia.")
+    st.warning("Nessuna linea rimasta dopo i controlli automatici.")
     st.stop()
 frame = pd.DataFrame(player_rows).sort_values("Linea")
 frame["Principale"] = frame["Principale"].map({True: "Sì", False: ""})
