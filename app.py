@@ -254,9 +254,9 @@ def espn_event_date(info):
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def espn_team_schedule(team_id, end_year):
+def espn_team_schedule(team_id, end_year, season_type=2):
     """One ESPN schedule request supplies game dates for an entire season."""
-    payload = espn_json(f"{ESPN_SITE}/teams/{team_id}/schedule", season=end_year, seasontype=2)
+    payload = espn_json(f"{ESPN_SITE}/teams/{team_id}/schedule", season=end_year, seasontype=season_type)
     dates = {}
     for event in payload.get("events") or []:
         if not isinstance(event, dict):
@@ -268,7 +268,7 @@ def espn_team_schedule(team_id, end_year):
     return dates
 
 
-def espn_log_to_frame(data):
+def espn_log_to_frame(data, season_type=2):
     labels = [str(x).strip().upper() for x in data.get("labels") or []]
     metadata = data.get("events") or {}
     if isinstance(metadata, list):
@@ -277,9 +277,13 @@ def espn_log_to_frame(data):
     for season_type in data.get("seasonTypes") or []:
         type_id = str(season_type.get("id") or season_type.get("type") or "")
         type_name = str(season_type.get("displayName") or season_type.get("name") or "").lower()
-        if type_id and type_id != "2" and "regular" not in type_name:
-            continue
-        if not type_id and "regular" not in type_name:
+        # ESPN season type 2 = regular season; 3 = postseason/playoffs.
+        # When ESPN provides a numeric type, it takes precedence over the label.
+        expected_words = ("regular",) if season_type == 2 else ("postseason", "post-season", "playoff")
+        if type_id in ("1", "2", "3", "4"):
+            if type_id != str(season_type):
+                continue
+        elif not any(word in type_name for word in expected_words):
             continue
         for category in season_type.get("categories") or []:
             if str(category.get("type", "")).lower() == "total":
@@ -306,6 +310,7 @@ def espn_log_to_frame(data):
                 opp = opponent.get("abbreviation") or opponent.get("displayName") or "?"
                 rows.append({
                     "GAME_ID": event_id,
+                    "SEASON_TYPE": season_type,
                     "GAME_DATE": espn_event_date(info) or espn_event_date(event),
                     "MATCHUP": f"{'@' if str(info.get('atVs', '')).strip() == '@' else 'vs'} {opp}",
                     "MIN": values[local_labels.index("MIN")] if "MIN" in local_labels else None,
@@ -313,7 +318,7 @@ def espn_log_to_frame(data):
                     "REB": values[local_labels.index("REB")],
                     "AST": values[local_labels.index("AST")],
                 })
-    frame = pd.DataFrame(rows, columns=["GAME_ID", "GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"])
+    frame = pd.DataFrame(rows, columns=["GAME_ID", "SEASON_TYPE", "GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"])
     if not frame.empty:
         frame = frame.drop_duplicates(subset=["GAME_ID"], keep="first")
     return frame
@@ -326,7 +331,9 @@ def prepare_game_log(log, team_id, season, require_dates=True):
         return log
     dates = pd.to_datetime(log["GAME_DATE"], errors="coerce", utc=True)
     if dates.isna().any() and team_id:
-        schedule = espn_team_schedule(team_id, int(season[:4]) + 1)
+        schedule = {}
+        for kind in sorted(set(log["SEASON_TYPE"].astype(int))) if "SEASON_TYPE" in log.columns else [2]:
+            schedule.update(espn_team_schedule(team_id, int(season[:4]) + 1, kind))
         replacement = pd.to_datetime(log["GAME_ID"].astype(str).map(schedule), errors="coerce", utc=True)
         dates = dates.fillna(replacement)
     log["GAME_DATE"] = dates
@@ -360,10 +367,22 @@ def analysis_row(title, data, stat, line):
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Recupero storico ESPN…")
-def espn_game_log(athlete_id, season):
+def espn_game_log(athlete_id, season, season_type=2):
     end_year = int(season.split("-")[0]) + 1
-    payload = espn_json(f"{ESPN_WEB}/athletes/{athlete_id}/gamelog", season=end_year)
-    return espn_log_to_frame(payload)
+    # Explicit seasonType is necessary: ESPN defaults to regular-season logs.
+    payload = espn_json(f"{ESPN_WEB}/athletes/{athlete_id}/gamelog", season=end_year, seasonType=season_type)
+    return espn_log_to_frame(payload, season_type=season_type)
+
+
+def selected_game_log(athlete_id, season, mode):
+    """Fetch only the selected competition; merge without duplicating event IDs."""
+    kinds = [2, 3] if mode == "Regular season + Playoff" else ([3] if mode == "Playoff" else [2])
+    frames = [espn_game_log(athlete_id, season, kind) for kind in kinds]
+    nonempty = [frame for frame in frames if not frame.empty]
+    if not nonempty:
+        return frames[0].copy()
+    result = pd.concat(nonempty, ignore_index=True)
+    return result.drop_duplicates(subset=["GAME_ID"], keep="first")
 
 
 st.title("🏀 NBA STATS 2.0")
@@ -432,11 +451,13 @@ with st.expander("🔎 Diagnostica mercati (nessuna richiesta OddsPapi aggiuntiv
 
 st.divider()
 st.subheader("📈 Statistiche NBA — ESPN")
-st.caption("Storico delle partite tramite ESPN, senza API a pagamento e senza richieste OddsPapi aggiuntive. Solo regular season.")
+st.caption("Storico delle partite tramite ESPN, senza API a pagamento e senza richieste OddsPapi aggiuntive.")
 season = st.selectbox("Stagione NBA", ["2026-27", "2025-26", "2024-25"])
+competition_mode = st.radio("Tipo di competizione", ["Regular season", "Playoff", "Regular season + Playoff"], horizontal=True)
+
 if st.button("📊 Carica statistiche NBA del giocatore"):
-    st.session_state.stats_selection = (player_name, season)
-if st.session_state.get("stats_selection") == (player_name, season):
+    st.session_state.stats_selection = (player_name, season, competition_mode)
+if st.session_state.get("stats_selection") == (player_name, season, competition_mode):
     diagnostic_stage = "Identificazione giocatore su ESPN"
     try:
         fixture = options[choice]
@@ -447,18 +468,20 @@ if st.session_state.get("stats_selection") == (player_name, season):
                 st.json({"Giocatore cercato": player_name, "Nome normalizzato": normalized_name(player_name), **matching_diagnostics})
         else:
             diagnostic_stage = "Recupero storico partite da ESPN"
-            log = espn_game_log(nba_player["id"], season)
+            log = selected_game_log(nba_player["id"], season, competition_mode)
             diagnostic_stage = "Elaborazione e visualizzazione statistiche"
             if log.empty:
-                st.info("Nessuna partita di regular season disponibile per questo giocatore e questa stagione.")
+                st.info(f"Nessuna partita disponibile in modalità {competition_mode} per questo giocatore e questa stagione.")
             else:
                 log = prepare_game_log(log, nba_player.get("team_id"), season)
                 stat = STATS[market_label]
-                st.write(f"**{nba_player['full_name']} — {season} — {len(log)} partite**")
+                st.write(f"**{nba_player['full_name']} — {season} — {competition_mode} — {len(log)} partite**")
+                if competition_mode != "Regular season":
+                    st.caption("Nei playoff il campione può essere ridotto. Le percentuali sono calcolate solo sulle partite effettivamente disponibili.")
                 line = st.selectbox("Linea da analizzare", sorted(frame["Linea"].unique()), index=0)
                 # The previous season is loaded only when the user requests the analysis.
                 previous_season = f"{int(season[:4])-1}-{str(int(season[:4]))[-2:]}"
-                previous_log = espn_game_log(nba_player["id"], previous_season)
+                previous_log = selected_game_log(nba_player["id"], previous_season, competition_mode)
                 if not previous_log.empty:
                     previous_log = prepare_game_log(previous_log, nba_player.get("team_id"), previous_season, require_dates=False)
                 missing_dates = int(log["GAME_DATE"].isna().sum())
@@ -470,8 +493,8 @@ if st.session_state.get("stats_selection") == (player_name, season):
                     st.warning(f"ESPN non fornisce una data verificabile per {missing_dates} partite su {len(log)}. "
                                "Le analisi ultime 5/10/20 sono sospese per evitare risultati inesatti; "
                                "le statistiche dell'intera stagione restano disponibili.")
-                periods.extend([(f"Stagione {season}", log),
-                                (f"Stagione {previous_season}", previous_log)])
+                periods.extend([(f"{competition_mode} {season}", log),
+                                (f"{competition_mode} {previous_season}", previous_log)])
                 st.caption(f"Linea {line:g} · Over: risultato > {line:g} · Under: risultato < {line:g}")
                 for period_title, period_log in periods:
                     values = period_log[stat].dropna() if not period_log.empty else pd.Series(dtype=float)
@@ -499,8 +522,13 @@ if st.session_state.get("stats_selection") == (player_name, season):
                             if count:
                                 st.metric(f"Media {stat}", f"{values.mean():.1f}",
                                           f"{values.mean()-line:+.1f} rispetto alla linea")
-                st.subheader(f"Dettaglio partite — {season}")
-                visible = log[["GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST", "PRA"]].copy()
+                st.subheader(f"Dettaglio partite — {season} · {competition_mode}")
+                detail_columns = ["GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST", "PRA"]
+                if competition_mode == "Regular season + Playoff":
+                    detail_columns.insert(1, "SEASON_TYPE")
+                visible = log[detail_columns].copy()
+                if "SEASON_TYPE" in visible:
+                    visible["SEASON_TYPE"] = visible["SEASON_TYPE"].map({2: "Regular season", 3: "Playoff"})
                 visible["GAME_DATE"] = visible["GAME_DATE"].dt.strftime("%d/%m/%Y")
                 st.dataframe(visible, hide_index=True, width="stretch")
                 with st.expander("📊 Riepilogo comparativo"):
