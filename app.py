@@ -580,6 +580,60 @@ def finder_player_index(end_year):
     return index
 
 
+def odds_source_audit(odds, catalog, match_name):
+    """Read bookmaker source fields already downloaded; NO extra API requests.
+
+    'Attivo nel feed' is not a guarantee that Bet365 offers the selection.
+    """
+    bookmaker = (odds.get("bookmakerOdds") or {}).get("bet365.it") or {}
+    result = []
+    for market_id, market_data in (bookmaker.get("markets") or {}).items():
+        definition = catalog.get(str(market_id))
+        if not definition:
+            continue
+        kind = str(definition.get("marketType") or "")
+        if kind not in {t for kinds in MARKETS.values() for t in kinds}:
+            continue
+        names = {str(o.get("outcomeId")): str(o.get("outcomeName", ""))
+                 for o in definition.get("outcomes") or []}
+        for outcome_id, outcome in (market_data.get("outcomes") or {}).items():
+            label = names.get(str(outcome_id), "")
+            if kind.startswith("players-"):
+                match = re.fullmatch(r"\s*(\d+)\+\s*", label)
+                if not match:
+                    continue
+                line = float(int(match.group(1)) - 0.5)
+            else:
+                if label.strip().lower() not in ("over", "under"):
+                    continue
+                try:
+                    line = float(definition["handicap"])
+                except (ValueError, TypeError, KeyError):
+                    continue
+            for player_id, player in (outcome.get("players") or {}).items():
+                price = player.get("price")
+                if not isinstance(price, (int, float)) or price <= 1:
+                    continue
+                result.append({
+                    "Partita": match_name,
+                    "Giocatore": str(player.get("playerName") or ""),
+                    "Mercato API": kind,
+                    "Nome mercato API": str(definition.get("marketName") or ""),
+                    "Esito originale": label,
+                    "Linea interpretata": line,
+                    "Quota": price,
+                    "Mercato attivo feed": market_data.get("marketActive"),
+                    "Giocatore attivo feed": player.get("active"),
+                    "Bookmaker attivo feed": bookmaker.get("bookmakerIsActive"),
+                    "Mercato ID": str(market_id),
+                    "Esito ID": str(outcome_id),
+                    "Bookmaker market ID": str(market_data.get("bookmakerMarketId") or ""),
+                    "Bookmaker outcome ID": str(player.get("bookmakerOutcomeId") or ""),
+                    "Ultima variazione feed": str(player.get("changedAt") or ""),
+                })
+    return result
+
+
 def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
                 min_value, progress_callback=None):
     """One cached OddsPapi odds request per fixture, four markets per response.
@@ -589,6 +643,8 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
     results, issues = [], []
     players_index = finder_player_index(int(season[:4]) + 1)
     odds_rows = []
+    raw_audit = []
+    filter_audit = []
     for idx, fixture in enumerate(fixtures):
         fid = str(fixture["fixtureId"])
         match_name = f"{fixture.get('participant1Name', '?')} - {fixture.get('participant2Name', '?')}"
@@ -596,13 +652,18 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
             progress_callback(idx / max(len(fixtures), 1) * 0.25, f"Quote: {match_name}")
         try:
             odds = get_odds(fid, st.session_state.odds_refresh_versions.get(fid, 0))
+            raw_audit.extend(odds_source_audit(odds, catalog, match_name))
             for market_label in MARKETS:
                 parsed, _ = parse_odds(odds, catalog, market_label)
                 grouped = {}
                 for row in parsed:
                     grouped.setdefault(row["Giocatore"], []).append(row)
                 for player_name, group in grouped.items():
-                    filtered, _ = auto_filter_suspicious_lines(group)
+                    filtered, excluded = auto_filter_suspicious_lines(group)
+                    for row in excluded:
+                        filter_audit.append({"Partita": match_name, "Giocatore": player_name,
+                                             "Mercato": STATS[market_label], "Linea": row["Linea"],
+                                             "Motivo": "Inversione significativa quote Over (euristica)"})
                     for row in filtered:
                         for side in ("Over", "Under"):
                             price = row.get(side)
@@ -654,7 +715,7 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
     if progress_callback:
         progress_callback(1.0, "Analisi completata")
     results.sort(key=lambda x: (x["Value stimato %"], x["Partite"]), reverse=True)
-    return results, issues, len(odds_rows), total
+    return results, issues, len(odds_rows), total, raw_audit, filter_audit
 
 
 def render_value_finder(fixtures, selected_date):
@@ -670,6 +731,8 @@ def render_value_finder(fixtures, selected_date):
     with c3:
         odds_max = st.number_input("Quota massima", min_value=1.01, max_value=20.0, value=3.00, step=0.10)
     min_value = st.slider("Value stimato minimo (%)", min_value=0, max_value=50, value=5, step=1)
+    st.caption("Nessuna soglia minima arbitraria: anche le linee 0,5 vengono esaminate. "
+               "La disponibilità reale su Bet365 non è certificata dal feed.")
     st.caption("Il value è una stima euristica: usa frequenze stagionali corrette verso il 50% e andamento recente. Non include infortuni, avversario, quintetti o casa/trasferta.")
     if odds_min > odds_max:
         st.warning("La quota minima deve essere inferiore o uguale alla quota massima.")
@@ -679,13 +742,14 @@ def render_value_finder(fixtures, selected_date):
         progress = st.progress(0, text="Preparazione analisi…")
         try:
             catalog = get_markets()
-            results, issues, odds_count, player_count = finder_scan(
+            results, issues, odds_count, player_count, raw_audit, filter_audit = finder_scan(
                 fixtures, catalog, season, int(min_games), float(odds_min), float(odds_max),
                 int(min_value), lambda p, t: progress.progress(min(1.0, max(0.0, p)), text=t))
             st.session_state.finder_results = {
                 "date": str(selected_date), "season": season,
                 "results": results, "issues": issues,
                 "odds_count": odds_count, "player_count": player_count,
+                "raw_audit": raw_audit, "filter_audit": filter_audit,
             }
         except Exception as exc:
             st.error(f"Scansione interrotta ({type(exc).__name__}). Le quote già in cache restano disponibili.")
@@ -694,7 +758,9 @@ def render_value_finder(fixtures, selected_date):
     saved = st.session_state.get("finder_results")
     if not saved or saved["date"] != str(selected_date) or saved["season"] != season:
         return
-    st.caption(f"Quote candidate: {saved['odds_count']} · Giocatori esaminati: {saved['player_count']} · Segnalazioni: {len(saved['issues'])}")
+    st.caption(f"Quote candidate: {saved['odds_count']} · Giocatori esaminati: {saved['player_count']} · "
+               f"Linee escluse per inversione quote: {len(saved.get('filter_audit', []))} · "
+               f"Segnalazioni: {len(saved['issues'])}")
     if saved["results"]:
         df = pd.DataFrame(saved["results"])
         st.write(f"**{len(df)} opportunità individuate** (ordinate per value stimato)")
@@ -703,6 +769,23 @@ def render_value_finder(fixtures, selected_date):
                            file_name="nba_value_finder.csv", mime="text/csv")
     else:
         st.warning("Nessuna opportunità supera i filtri, oppure i dati ESPN disponibili sono insufficienti.")
+    with st.expander("🔬 Diagnostica originale OddsPapi — linee e stati del feed"):
+        st.warning("'Attivo nel feed' NON significa 'disponibile su Bet365'. "
+                   "Questa diagnostica mostra esattamente quali esiti e identificativi sono stati ricevuti, "
+                   "senza effettuare nuove richieste OddsPapi.")
+        audit_df = pd.DataFrame(saved.get("raw_audit", []))
+        if not audit_df.empty:
+            suspicious = audit_df.loc[audit_df["Linea interpretata"] <= 0.5]
+            st.write(f"**Esiti con linea 0,5 nel feed:** {len(suspicious)}")
+            st.dataframe(suspicious, hide_index=True, width="stretch")
+            st.download_button("⬇️ Scarica diagnostica completa CSV",
+                               audit_df.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="odds_feed_diagnostica.csv", mime="text/csv")
+        else:
+            st.info("Nessun esito disponibile per la diagnostica.")
+        if saved.get("filter_audit"):
+            st.write("**Linee escluse dal controllo di coerenza delle quote:**")
+            st.dataframe(pd.DataFrame(saved["filter_audit"]), hide_index=True, width="stretch")
     if saved["issues"]:
         with st.expander(f"⚠️ Dettagli: {len(saved['issues'])} giocatori/partite non elaborati"):
             st.write("\n".join(f"- {issue}" for issue in saved["issues"][:100]))
@@ -710,7 +793,7 @@ def render_value_finder(fixtures, selected_date):
 
 st.title("🏀 NBA STATS 2.0")
 st.caption("Quote Bet365 Italia tramite OddsPapi · Statistiche NBA da ESPN (fonte gratuita)")
-st.info("Le quote provengono da OddsPapi. Il filtro automatico esclude alcune linee sospette, ma la disponibilità effettiva va verificata su Bet365.")
+st.info("Le quote provengono da OddsPapi. Le anomalie vengono segnalate e documentate con una diagnostica del feed; la disponibilità effettiva va verificata su Bet365.")
 if not API_KEY:
     st.error("Configura ODDSPAPI_API_KEY nei Secrets di Streamlit.")
     st.stop()
