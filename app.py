@@ -382,38 +382,41 @@ def espn_game_log(athlete_id, season, season_type=2):
 
 
 def selected_game_log(athlete_id, season, mode, team_id=None):
-    """Separate games by ESPN's season grouping and independent team schedules."""
-    kinds = [2, 3] if mode == "Regular season + Playoff" else ([3] if mode == "Playoff" else [2])
+    """Use the original ESPN default log as the regular-season source.
+
+    ESPN's seasonType=2 request can unexpectedly return postseason games. The
+    no-seasonType request is the same one used by the previously working app.
+    Playoff event IDs are subtracted from regular-season event IDs, ensuring
+    no postseason game is accidentally included in regular-season results.
+    """
     end_year = int(season[:4]) + 1
-    schedules = {}
-    if team_id:
-        for kind in (2, 3):
-            try:
-                schedules[kind] = espn_team_schedule(team_id, end_year, kind)
-            except requests.RequestException:
-                schedules[kind] = {}
-    # Schedules only identify competition if their event IDs differ.
-    regular_ids = set(schedules.get(2, {})) - set(schedules.get(3, {}))
-    playoff_ids = set(schedules.get(3, {})) - set(schedules.get(2, {}))
-    frames = []
-    for kind in kinds:
-        frame = espn_game_log(athlete_id, season, kind).copy()
-        if frame.empty:
-            continue
-        for idx, row in frame.iterrows():
-            eid = str(row["GAME_ID"])
-            if eid in regular_ids:
-                frame.at[idx, "SEASON_TYPE"] = 2
-            elif eid in playoff_ids:
-                frame.at[idx, "SEASON_TYPE"] = 3
-        # Games with unverified competition are omitted rather than mislabeled.
-        frame = frame.loc[frame["SEASON_TYPE"].eq(kind)].copy()
-        if not frame.empty:
-            frames.append(frame)
-    if not frames:
-        return pd.DataFrame(columns=["GAME_ID", "SEASON_TYPE", "GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"])
-    result = pd.concat(frames, ignore_index=True)
-    return result.drop_duplicates(subset=["GAME_ID"], keep="first").reset_index(drop=True)
+    empty = pd.DataFrame(columns=["GAME_ID", "SEASON_TYPE", "GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"])
+
+    regular_payload = espn_json(f"{ESPN_WEB}/athletes/{athlete_id}/gamelog", season=end_year)
+    regular = espn_log_to_frame(regular_payload).copy()
+    playoffs = espn_game_log(athlete_id, season, 3).copy()
+
+    # ESPN schedule endpoints may ignore the requested season type, so we do
+    # not use schedule IDs for classification. Only verified playoff log IDs.
+    playoff_ids = set(playoffs["GAME_ID"].astype(str)) if not playoffs.empty else set()
+
+    if not regular.empty:
+        regular = regular.loc[~regular["GAME_ID"].astype(str).isin(playoff_ids)].copy()
+        regular["SEASON_TYPE"] = 2
+    if not playoffs.empty:
+        playoffs = playoffs.copy()
+        playoffs["SEASON_TYPE"] = 3
+
+    if mode == "Regular season":
+        return regular if not regular.empty else empty.copy()
+    if mode == "Playoff":
+        return playoffs if not playoffs.empty else empty.copy()
+    if mode == "Regular season + Playoff":
+        frames = [f for f in (regular, playoffs) if not f.empty]
+        if not frames:
+            return empty.copy()
+        return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["GAME_ID"], keep="last").reset_index(drop=True)
+    raise ValueError("Modalità competizione non riconosciuta")
 
 
 st.title("🏀 NBA STATS 2.0")
