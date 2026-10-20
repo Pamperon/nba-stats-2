@@ -1,4 +1,4 @@
-"""NBA STATS 2.0: OddsPapi Bet365 + official NBA player game logs."""
+"""NBA STATS 2.0: OddsPapi Bet365 + free ESPN player game logs."""
 from datetime import datetime, timedelta, timezone
 import re
 import logging
@@ -154,33 +154,39 @@ def espn_teams():
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
-def espn_roster(team_id, end_year):
-    return espn_json(f"{ESPN_SITE}/teams/{team_id}/roster", season=end_year)
+def espn_roster(team_id, end_year=None):
+    # ESPN's current roster does not need a season parameter. Some historical
+    # season queries return HTTP 200 with an empty athletes list.
+    params = {"season": end_year} if end_year is not None else {}
+    return espn_json(f"{ESPN_SITE}/teams/{team_id}/roster", **params)
 
 
 def roster_athletes(payload):
-    """ESPN can return flat athletes or position-grouped athlete lists."""
+    """Traverse ESPN roster shapes, including position groups and wrappers."""
+    seen = set()
+
     def visit(node):
         if isinstance(node, list):
-            for child in node:
-                yield from visit(child)
+            for item in node:
+                yield from visit(item)
         elif isinstance(node, dict):
-            if "athlete" in node and isinstance(node["athlete"], dict):
-                yield from visit(node["athlete"])
-            if "id" in node and (node.get("displayName") or node.get("fullName")):
-                yield node
-            for key in ("items", "athletes"):
-                if key in node:
-                    yield from visit(node[key])
-    yield from visit(payload.get("athletes") or [])
+            # ESPN sometimes nests the athlete under an `athlete` key.
+            athlete = node.get("athlete")
+            if isinstance(athlete, dict):
+                yield from visit(athlete)
+            athlete_id = node.get("id")
+            name = node.get("displayName") or node.get("fullName") or node.get("name")
+            if athlete_id is not None and name and str(athlete_id).isdigit():
+                key = str(athlete_id)
+                if key not in seen:
+                    seen.add(key)
+                    yield {"id": key, "displayName": name}
+            # Some responses contain groups such as {"position":...,"items":...}.
+            for key, value in node.items():
+                if key != "athlete" and isinstance(value, (list, dict)):
+                    yield from visit(value)
 
-
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def espn_search_player(name):
-    """Search is optional; roster matching remains authoritative."""
-    # ESPN's general search API is not a reliable NBA athlete directory.
-    # Returning no match here avoids attributing data to a different athlete.
-    return None
+    yield from visit(payload.get("athletes") or payload.get("items") or [])
 
 
 def match_espn_player(name, home_team, away_team, end_year):
@@ -198,22 +204,38 @@ def match_espn_player(name, home_team, away_team, end_year):
         matched = any(normalized_name(t) in fixture_names for t in names if t)
         (primary if matched else remaining).append(str(team_id))
 
-    checked, failed = 0, 0
-    # First check the teams in the selected matchup. If their rosters do not
-    # contain the player, check the other NBA rosters as a free fallback.
-    for team_id in primary + remaining:
-        try:
-            roster = espn_roster(team_id, end_year)
-        except requests.RequestException:
-            failed += 1
-            continue
-        checked += 1
-        for athlete in roster_athletes(roster):
-            full_name = athlete.get("displayName") or athlete.get("fullName") or ""
-            if normalized_name(full_name) == target and str(athlete.get("id", "")).isdigit():
-                return {"id": str(athlete["id"]), "full_name": full_name}, {"Rose controllate": checked, "Rose non raggiungibili": failed}
-    return None, {"Rose controllate": checked, "Rose non raggiungibili": failed,
-                  "Squadre ESPN nel catalogo": len(teams)}
+    checked, failed, athletes_seen = 0, 0, 0
+    sample_names = []
+    # First use the current roster: it is the most reliable ESPN roster URL.
+    # Only if no match is found, try the selected historical season.
+    for season_value in (None, end_year):
+        for team_id in primary + remaining:
+            try:
+                roster = espn_roster(team_id, season_value)
+            except requests.RequestException:
+                failed += 1
+                continue
+            checked += 1
+            for athlete in roster_athletes(roster):
+                athletes_seen += 1
+                full_name = athlete["displayName"]
+                if len(sample_names) < 8:
+                    sample_names.append(full_name)
+                if normalized_name(full_name) == target:
+                    return {"id": athlete["id"], "full_name": full_name}, {
+                        "Rose controllate": checked,
+                        "Rose non raggiungibili": failed,
+                        "Atleti letti": athletes_seen,
+                        "Fonte rosa": "Attuale" if season_value is None else f"Stagione {season_value}",
+                    }
+    return None, {
+        "Rose controllate": checked,
+        "Rose non raggiungibili": failed,
+        "Squadre ESPN nel catalogo": len(teams),
+        "Atleti letti": athletes_seen,
+        "Esempi di nomi ESPN": sample_names,
+        "Controlli": "Rose attuali e storiche; nessuna corrispondenza esatta",
+    }
 
 
 def espn_log_to_frame(data):
@@ -344,7 +366,7 @@ if st.session_state.get("stats_selection") == (player_name, season):
         fixture = options[choice]
         nba_player, matching_diagnostics = match_espn_player(player_name, fixture.get("participant1Name", ""), fixture.get("participant2Name", ""), int(season[:4]) + 1)
         if not nba_player:
-            st.warning("Giocatore non trovato con certezza nelle rose ESPN. Nessuna statistica attribuita per approssimazione.")
+            st.warning("Giocatore non identificato nelle rose ESPN. Controlla la diagnostica: indica quanti atleti sono stati effettivamente letti.")
             with st.expander("🔎 Diagnostica abbinamento ESPN", expanded=True):
                 st.json({"Giocatore cercato": player_name, "Nome normalizzato": normalized_name(player_name), **matching_diagnostics})
         else:
