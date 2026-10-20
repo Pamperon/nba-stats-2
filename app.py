@@ -132,10 +132,20 @@ def nba_player_directory():
 @st.cache_data(ttl=6 * 3600, show_spinner="Recupero statistiche ufficiali NBA…")
 def nba_game_log(player_id, season):
     from nba_api.stats.endpoints import playergamelog
-    result = playergamelog.PlayerGameLog(
-        player_id=player_id, season=season, season_type_all_star="Regular Season", timeout=25
-    ).get_data_frames()[0]
-    return result
+    # A timeout can be transient. Retry once with a slightly longer timeout.
+    # Both requests go directly to stats.nba.com; neither uses OddsPapi.
+    for attempt, timeout_seconds in enumerate((15, 35), start=1):
+        try:
+            return playergamelog.PlayerGameLog(
+                player_id=player_id,
+                season=season,
+                season_type_all_star="Regular Season",
+                timeout=timeout_seconds,
+            ).get_data_frames()[0]
+        except requests.exceptions.Timeout:
+            logger.warning("NBA game log timed out: attempt=%s timeout=%ss", attempt, timeout_seconds)
+            if attempt == 2:
+                raise
 
 
 def match_nba_player(odds_name, directory):
@@ -213,7 +223,7 @@ with st.expander("🔎 Diagnostica mercati (nessuna richiesta OddsPapi aggiuntiv
 
 st.divider()
 st.subheader("📈 Statistiche ufficiali NBA — prima integrazione")
-st.caption("Le statistiche utilizzano nba_api e non consumano richieste OddsPapi. La disponibilità dipende dai server stats.nba.com.")
+st.caption("Le statistiche utilizzano nba_api e non consumano richieste OddsPapi. In caso di timeout, viene effettuato un solo tentativo aggiuntivo.")
 season = st.selectbox("Stagione NBA", ["2026-27", "2025-26", "2024-25"])
 if st.button("📊 Carica statistiche NBA del giocatore"):
     st.session_state.stats_selection = (player_name, season)
@@ -262,7 +272,8 @@ if st.session_state.get("stats_selection") == (player_name, season):
         with st.expander("🔎 Diagnostica connessione NBA (nessuna richiesta aggiuntiva)", expanded=True):
             st.json({"Fase": diagnostic_stage, "Tipo errore": error_type,
                      "Stato HTTP": status if status is not None else "Non disponibile",
-                     "Giocatore": player_name, "Stagione": season})
+                     "Giocatore": player_name, "Stagione": season,
+                     "Tentativi previsti in caso di timeout": 2})
             st.caption("Questi dettagli sono ricavati dall'errore già avvenuto: non viene eseguito alcun nuovo test di rete. Non condividere eventuali credenziali presenti in altri log.")
 
 st.caption("Quote: cache 24 ore · Calendario: 24 ore · Catalogo: 7 giorni · Statistiche NBA: cache 6 ore. La cache può svuotarsi ai riavvii.")
