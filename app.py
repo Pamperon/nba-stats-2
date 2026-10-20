@@ -383,47 +383,133 @@ def espn_game_log(athlete_id, season, season_type=2):
     return espn_log_to_frame(payload, season_type=season_type)
 
 
-def selected_game_log(athlete_id, season, mode, team_id=None):
-    """Use the original ESPN default log as the regular-season source.
+def _espn_competition_type(event):
+    """Read competition type from explicit ESPN event metadata only."""
+    if not isinstance(event, dict):
+        return None
+    candidates = [event.get("season"), event.get("seasonType"),
+                  event.get("season_type"), event.get("type")]
+    for comp in event.get("competitions") or []:
+        if isinstance(comp, dict):
+            candidates.extend([comp.get("season"), comp.get("seasonType")])
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            candidate = candidate.get("type") or candidate.get("id") or candidate.get("value")
+        if str(candidate) in ("2", "3"):
+            return int(candidate)
+        if isinstance(candidate, str):
+            value = candidate.lower()
+            if "regular" in value:
+                return 2
+            if "playoff" in value or "postseason" in value:
+                return 3
+    return None
 
-    ESPN's seasonType=2 request can unexpectedly return postseason games. The
-    no-seasonType request is the same one used by the previously working app.
-    Playoff event IDs are subtracted from regular-season event IDs, ensuring
-    no postseason game is accidentally included in regular-season results.
-    """
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def espn_schedule_competition_ids(team_id, end_year):
+    """Resolve event types from ESPN schedules; ignore season-type query if ESPN ignores it."""
+    sources = {}
+    for requested_type in (2, 3):
+        payload = espn_json(f"{ESPN_SITE}/teams/{team_id}/schedule", season=end_year, seasontype=requested_type)
+        for event in payload.get("events") or []:
+            if not isinstance(event, dict) or not event.get("id"):
+                continue
+            event_id = str(event["id"])
+            explicit_type = _espn_competition_type(event)
+            record = sources.setdefault(event_id, {"explicit": set(), "requests": set()})
+            if explicit_type:
+                record["explicit"].add(explicit_type)
+            record["requests"].add(requested_type)
+    result = {}
+    for event_id, record in sources.items():
+        if len(record["explicit"]) == 1:
+            result[event_id] = next(iter(record["explicit"]))
+        elif not record["explicit"] and len(record["requests"]) == 1:
+            # Trust schedule membership only if the requested filters disagree.
+            result[event_id] = next(iter(record["requests"]))
+    return result
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def espn_event_competition_type(event_id):
+    """Fallback: one free ESPN event summary when schedule lacks type metadata."""
+    payload = espn_json(f"{ESPN_SITE}/summary", event=event_id)
+    header = payload.get("header") or {}
+    return _espn_competition_type(header) or _espn_competition_type(payload.get("gameInfo"))
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Classificazione partite ESPN…")
+def espn_classified_game_log(athlete_id, season, team_id):
+    """Use event metadata to distinguish regular season from playoffs for any player."""
     end_year = int(season[:4]) + 1
-    empty = pd.DataFrame(columns=["GAME_ID", "SEASON_TYPE", "GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"])
+    raw = []
+    for requested_type in (None, 3):
+        params = {"season": end_year}
+        if requested_type is not None:
+            params["seasonType"] = requested_type
+        payload = espn_json(f"{ESPN_WEB}/athletes/{athlete_id}/gamelog", **params)
+        frame = espn_log_to_frame(payload)
+        if not frame.empty:
+            raw.append(frame)
+    columns = ["GAME_ID", "SEASON_TYPE", "GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"]
+    if not raw:
+        return pd.DataFrame(columns=columns)
+    games = pd.concat(raw, ignore_index=True).drop_duplicates(subset=["GAME_ID"], keep="first").reset_index(drop=True)
+    # The roster team may be the current team; for players who moved teams,
+    # game summaries can resolve event IDs missing from this team's schedule.
+    known_types = espn_schedule_competition_ids(team_id, end_year) if team_id else {}
+    unresolved = [event_id for event_id in games["GAME_ID"].astype(str) if event_id not in known_types]
+    for event_id in unresolved:
+        try:
+            found = espn_event_competition_type(event_id)
+        except (requests.RequestException, ValueError, TypeError):
+            found = None
+        if found in (2, 3):
+            known_types[event_id] = found
+    games["SEASON_TYPE"] = games["GAME_ID"].astype(str).map(known_types)
+    missing = int(games["SEASON_TYPE"].isna().sum())
+    if missing:
+        raise ValueError(f"ESPN non consente di classificare {missing} partite su {len(games)}: impossibile distinguere regular season e playoff senza inventare dati.")
+    games["SEASON_TYPE"] = games["SEASON_TYPE"].astype(int)
+    return games
 
-    regular_payload = espn_json(f"{ESPN_WEB}/athletes/{athlete_id}/gamelog", season=end_year)
-    regular = espn_log_to_frame(regular_payload).copy()
-    playoffs = espn_game_log(athlete_id, season, 3).copy()
 
-    # ESPN schedule endpoints may ignore the requested season type, so we do
-    # not use schedule IDs for classification. Only verified playoff log IDs.
-    playoff_ids = set(playoffs["GAME_ID"].astype(str)) if not playoffs.empty else set()
-
-    if not regular.empty:
-        regular = regular.loc[~regular["GAME_ID"].astype(str).isin(playoff_ids)].copy()
-        regular["SEASON_TYPE"] = 2
-    if not playoffs.empty:
-        playoffs = playoffs.copy()
-        playoffs["SEASON_TYPE"] = 3
-
+def selected_game_log(athlete_id, season, mode, team_id=None):
+    games = espn_classified_game_log(athlete_id, season, team_id)
     if mode == "Regular season":
-        return regular if not regular.empty else empty.copy()
+        return games.loc[games["SEASON_TYPE"] == 2].copy()
     if mode == "Playoff":
-        return playoffs if not playoffs.empty else empty.copy()
+        return games.loc[games["SEASON_TYPE"] == 3].copy()
     if mode == "Regular season + Playoff":
-        frames = [f for f in (regular, playoffs) if not f.empty]
-        if not frames:
-            return empty.copy()
-        return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["GAME_ID"], keep="last").reset_index(drop=True)
+        return games.copy()
     raise ValueError("Modalità competizione non riconosciuta")
+
+
+def auto_filter_suspicious_lines(player_rows):
+    """Exclude a stale low-line prefix only when odds show a clear price reset.
+
+    Higher points thresholds should not have materially lower Over prices.
+    This is a heuristic, not proof of availability at the bookmaker.
+    """
+    ordered = sorted(player_rows, key=lambda r: r["Linea"])
+    last_price = None
+    reset_at = None
+    for index, row in enumerate(ordered):
+        price = row.get("Over")
+        if not isinstance(price, (int, float)):
+            continue
+        if last_price is not None and last_price >= 1.35 and price < last_price * 0.75 and last_price - price >= 0.30:
+            reset_at = index
+        last_price = price
+    if reset_at is None:
+        return ordered, []
+    return ordered[reset_at:], ordered[:reset_at]
 
 
 st.title("🏀 NBA STATS 2.0")
 st.caption("Quote Bet365 Italia tramite OddsPapi · Statistiche NBA da ESPN (fonte gratuita)")
-st.info("Le quote alternative segnalate come inattive dall'API sono visibili per consultazione, ma la loro disponibilità va verificata su Bet365.")
+st.info("Le quote provengono da OddsPapi. Il filtro automatico esclude alcune linee sospette, ma la disponibilità effettiva va verificata su Bet365.")
 if not API_KEY:
     st.error("Configura ODDSPAPI_API_KEY nei Secrets di Streamlit.")
     st.stop()
@@ -472,14 +558,20 @@ player_name = st.selectbox("🏀 Giocatore", sorted({r["Giocatore"] for r in row
 player_rows = [r for r in rows if r["Giocatore"] == player_name]
 st.subheader(f"{player_name} · {market_label}")
 st.caption("Le soglie '+' mostrano soltanto la quota Over (20+ = Over 19,5). Nessuna quota Under viene inventata.")
-st.caption("Le quote provengono dal feed OddsPapi: un mercato indicato come attivo dall'API potrebbe non essere visibile su Bet365. Puoi escludere manualmente le linee non presenti.")
-min_line_enabled = st.checkbox("Escludi linee inferiori a una soglia verificata su Bet365", value=False)
-min_line = None
+st.caption("Il filtro automatico segnala anomalie nelle quote, ma non garantisce che ogni linea sia realmente presente su Bet365.")
+automatic_filter = st.checkbox("Filtro automatico linee sospette", value=True,
+                               help="Esclude gruppi di soglie con una forte inversione delle quote Over. Non verifica in tempo reale il sito Bet365.")
+if automatic_filter:
+    player_rows, excluded_rows = auto_filter_suspicious_lines(player_rows)
+    if excluded_rows:
+        st.caption(f"Filtro automatico: escluse {len(excluded_rows)} linee con andamento delle quote incoerente "
+                   f"(fino a {excluded_rows[-1]['Linea']:g}). Puoi disattivarlo per rivederle.")
+min_line_enabled = st.checkbox("Imposta manualmente la prima linea disponibile", value=False)
 if min_line_enabled:
     min_line = st.number_input("Prima linea disponibile su Bet365", min_value=0.5, max_value=200.5, value=14.5, step=1.0, format="%.1f")
     player_rows = [r for r in player_rows if r["Linea"] >= min_line]
 if not player_rows:
-    st.warning("Nessuna linea rimasta dopo il filtro. Disattivalo o abbassa la soglia.")
+    st.warning("Nessuna linea rimasta dopo i filtri. Disattivali o abbassa la soglia.")
     st.stop()
 frame = pd.DataFrame(player_rows).sort_values("Linea")
 frame["Principale"] = frame["Principale"].map({True: "Sì", False: ""})
