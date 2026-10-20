@@ -1,9 +1,6 @@
-"""NBA STATS 2.0 — quote Bet365 Italia da OddsPapi.
-La chiave deve essere configurata in Streamlit Secrets, mai in GitHub.
-"""
+"""NBA STATS 2.0: OddsPapi Bet365 + official NBA player game logs."""
 from datetime import datetime, timedelta, timezone
 import re
-
 import pandas as pd
 import requests
 import streamlit as st
@@ -16,7 +13,7 @@ MARKETS = {
     "Assist (AST)": ("playertotals-assists", "players-assists"),
     "Punti + Rimbalzi + Assist (PRA)": ("playertotals-ptsassreb", "players-ptsassreb"),
 }
-
+STATS = {"Punti (PTS)": "PTS", "Rimbalzi (REB)": "REB", "Assist (AST)": "AST", "Punti + Rimbalzi + Assist (PRA)": "PRA"}
 try:
     API_KEY = st.secrets["ODDSPAPI_API_KEY"]
 except (KeyError, FileNotFoundError):
@@ -25,244 +22,229 @@ except (KeyError, FileNotFoundError):
 
 def get_json(path, **params):
     if not API_KEY:
-        raise RuntimeError("Chiave ODDSPAPI_API_KEY assente nei Secrets di Streamlit.")
+        raise RuntimeError("Chiave OddsPapi assente in Streamlit Secrets.")
     try:
-        response = requests.get(
-            f"{BASE}/{path}",
-            params={**params, "apiKey": API_KEY, "language": "en"},
-            timeout=35,
-        )
-        response.raise_for_status()
-        return response.json()
+        resp = requests.get(f"{BASE}/{path}", params={**params, "apiKey": API_KEY, "language": "en"}, timeout=40)
+        resp.raise_for_status()
+        return resp.json()
     except requests.RequestException as exc:
-        # Non mostrare mai l'URL completo: contiene la chiave API.
+        # Never reveal exception's request URL, which contains the API key.
         status = getattr(getattr(exc, "response", None), "status_code", None)
-        raise RuntimeError(f"Richiesta OddsPapi non riuscita (HTTP {status or 'errore di rete'}).") from None
+        raise RuntimeError(f"OddsPapi: errore HTTP {status or 'di connessione'}.") from None
 
 
-@st.cache_data(ttl=7 * 24 * 3600, show_spinner="Caricamento catalogo mercati…")
+@st.cache_data(ttl=7 * 86400, show_spinner="Catalogo mercati…")
 def get_markets():
     data = get_json("markets")
     if not isinstance(data, list):
         raise ValueError("Formato catalogo mercati inatteso")
-    return {str(m["marketId"]): m for m in data if m.get("sportId") == 11}
+    return {str(m["marketId"]): m for m in data if str(m.get("sportId")) == "11"}
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner="Caricamento calendario NBA…")
-def get_fixtures(date_str):
-    day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    data = get_json(
-        "fixtures", sportId=11,
-        **{"from": day.strftime("%Y-%m-%dT%H:%M:%SZ"),
-           "to": (day + timedelta(days=1) - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")},
-    )
+@st.cache_data(ttl=86400, show_spinner="Calendario NBA…")
+def get_fixtures(day_string):
+    start = datetime.strptime(day_string, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    data = get_json("fixtures", sportId=11, **{
+        "from": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "to": (start + timedelta(days=1) - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
     if isinstance(data, dict):
         data = data.get("fixtures", data.get("data", []))
     if not isinstance(data, list):
         raise ValueError("Formato calendario inatteso")
-    return sorted([f for f in data if str(f.get("tournamentName", "")).lower() == "nba"],
-                  key=lambda f: f.get("startTime", ""))
+    return sorted((f for f in data if str(f.get("tournamentName", "")).casefold() == "nba"), key=lambda f: str(f.get("startTime", "")))
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner="Caricamento quote Bet365 Italia…")
-def get_odds(fixture_id, revision=0):
+@st.cache_data(ttl=86400, show_spinner="Quote Bet365…")
+def get_odds(fixture_id, refresh_version=0):
     return get_json("odds", fixtureId=fixture_id, bookmakers="bet365.it", verbosity=3)
 
 
-def market_diagnostics(odds_data, catalog, market_label, player_name=None):
-    """Solo dati già scaricati: non effettua chiamate HTTP."""
-    bookmaker = (odds_data.get("bookmakerOdds") or {}).get("bet365.it") or {}
-    requested = set(MARKETS[market_label])
-    stats = {"Mercati nel feed Bet365": len(bookmaker.get("markets") or {}),
-             "Mercati del tipo richiesto": 0, "Mercati alternativi (+)": 0,
-             "Mercati alternativi attivi": 0, "Mercati alternativi inattivi": 0,
-             "Mercati senza definizione": 0, "Soglie alternative del giocatore": 0}
-    examples = []
-    for mid, market in (bookmaker.get("markets") or {}).items():
-        definition = catalog.get(str(mid))
-        if definition is None:
-            stats["Mercati senza definizione"] += 1
-            continue
-        kind = definition.get("marketType", "")
-        if kind not in requested:
-            continue
-        stats["Mercati del tipo richiesto"] += 1
-        if not kind.startswith("players-"):
-            continue
-        stats["Mercati alternativi (+)"] += 1
-        active = market.get("marketActive") is True
-        stats["Mercati alternativi attivi" if active else "Mercati alternativi inattivi"] += 1
-        for outcome_id, outcome in (market.get("outcomes") or {}).items():
-            definition_outcome = next((x for x in definition.get("outcomes", [])
-                                       if str(x.get("outcomeId")) == str(outcome_id)), {})
-            label = definition_outcome.get("outcomeName", "")
-            for player in (outcome.get("players") or {}).values():
-                if player_name and player.get("playerName") != player_name:
-                    continue
-                if player.get("active") and isinstance(player.get("price"), (int, float)):
-                    stats["Soglie alternative del giocatore"] += 1
-                    if len(examples) < 12:
-                        examples.append({"Soglia": label, "Quota": player["price"],
-                                         "Mercato attivo": active})
-    return stats, examples
-
-
-def parse_odds(odds_data, catalog, market_label):
-    """Include soglie alternative anche con marketActive=False, segnalandole.
-
-    Non trasforma mai una quota segnalata inattiva in una quota disponibile.
-    """
-    bookmaker = (odds_data.get("bookmakerOdds") or {}).get("bet365.it") or {}
+def parse_odds(data, catalog, market_label):
+    bookmaker = (data.get("bookmakerOdds") or {}).get("bet365.it") or {}
     if not bookmaker.get("bookmakerIsActive", False) or bookmaker.get("suspended", False):
-        return []
-    types = MARKETS[market_label]
-    results = {}
+        return [], {"Bookmaker": "Non attivo o sospeso"}
+    rows = {}
+    diag = {"Mercati nel feed Bet365": len(bookmaker.get("markets") or {}), "Mercati del tipo richiesto": 0,
+            "Mercati alternativi (+)": 0, "Mercati alternativi attivi": 0,
+            "Mercati alternativi inattivi": 0, "Mercati senza definizione": 0}
     for market_id, market_data in (bookmaker.get("markets") or {}).items():
         definition = catalog.get(str(market_id))
-        if not definition or definition.get("marketType") not in types:
+        if not definition:
+            diag["Mercati senza definizione"] += 1
             continue
-        market_type = definition["marketType"]
-        is_alternative = market_type.startswith("players-")
-        market_active = market_data.get("marketActive") is True
-        # Manteniamo il filtro originario per gli Over/Under normali.
-        # Le soglie alternative inattive restano consultabili ma segnalate.
-        if not market_active and not is_alternative:
+        kind = definition.get("marketType", "")
+        if kind not in MARKETS[market_label]:
             continue
-        outcome_names = {str(o["outcomeId"]): o.get("outcomeName", "")
-                         for o in definition.get("outcomes", [])}
+        diag["Mercati del tipo richiesto"] += 1
+        is_alternative = kind.startswith("players-")
+        active_market = market_data.get("marketActive") is True
+        if is_alternative:
+            diag["Mercati alternativi (+)"] += 1
+            diag["Mercati alternativi attivi" if active_market else "Mercati alternativi inattivi"] += 1
+        elif not active_market:
+            continue  # Keep strict filtering for main O/U markets.
+        names = {str(o.get("outcomeId")): str(o.get("outcomeName", "")) for o in definition.get("outcomes", [])}
         for outcome_id, outcome in (market_data.get("outcomes") or {}).items():
-            name = outcome_names.get(str(outcome_id), "")
-            if market_type.startswith("playertotals-"):
+            name = names.get(str(outcome_id), "")
+            if is_alternative:
+                match = re.fullmatch(r"\s*(\d+)\+\s*", name)
+                if not match:
+                    continue
+                line, side = int(match.group(1)) - 0.5, "Over"
+            else:
                 if name.lower() not in ("over", "under"):
                     continue
                 try:
                     line = float(definition["handicap"])
-                except (KeyError, TypeError, ValueError):
+                except (ValueError, KeyError, TypeError):
                     continue
                 side = name.title()
-            else:
-                match = re.fullmatch(r"\s*(\d+)\+\s*", name)
-                if not match:
-                    continue
-                line = int(match.group(1)) - 0.5
-                side = "Over"
             for player_id, player in (outcome.get("players") or {}).items():
-                if player.get("active") is not True or not player.get("playerName"):
+                if not player.get("active") or not player.get("playerName"):
                     continue
                 price = player.get("price")
-                if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 1:
+                if not isinstance(price, (int, float)) or price <= 1:
                     continue
                 key = (str(player_id), line)
-                row = results.setdefault(key, {
-                    "Giocatore": player["playerName"], "Linea": line,
-                    "Over": None, "Under": None, "Principale": False,
-                    "Tipo": "Over/Under" if not is_alternative else "Soglia +",
-                    "Stato API": "Attivo" if market_active else "Mercato inattivo",
-                    "_side_active": {},
-                })
-                # Per duplicati privilegiamo la quota di un mercato attivo.
-                prior_active = row["_side_active"].get(side, False)
-                if row[side] is None or (market_active and not prior_active):
+                row = rows.setdefault(key, {"Giocatore": player["playerName"], "Linea": line,
+                    "Over": None, "Under": None, "Principale": False, "Tipo": "Soglia +" if is_alternative else "Over/Under",
+                    "Stato API": "Mercato inattivo" if not active_market else "Attivo"})
+                # Main O/U takes precedence when both markets describe the same line.
+                if row[side] is None or not is_alternative:
                     row[side] = price
-                    row["_side_active"][side] = market_active
-                if player.get("mainLine"):
-                    row["Principale"] = True
                 if not is_alternative:
                     row["Tipo"] = "Over/Under"
-                if any(row["_side_active"].values()):
                     row["Stato API"] = "Attivo"
-    for row in results.values():
-        del row["_side_active"]
-    return sorted(results.values(), key=lambda r: (r["Giocatore"], r["Linea"]))
+                if player.get("mainLine"):
+                    row["Principale"] = True
+    return sorted(rows.values(), key=lambda r: (r["Giocatore"], r["Linea"])), diag
+
+
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def nba_player_directory():
+    from nba_api.stats.static import players
+    return players.get_players()
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner="Recupero statistiche ufficiali NBA…")
+def nba_game_log(player_id, season):
+    from nba_api.stats.endpoints import playergamelog
+    result = playergamelog.PlayerGameLog(
+        player_id=player_id, season=season, season_type_all_star="Regular Season", timeout=25
+    ).get_data_frames()[0]
+    return result
+
+
+def match_nba_player(odds_name, directory):
+    # OddsPapi: "Cunningham, Cade"; nba_api: "Cade Cunningham".
+    parts = [p.strip() for p in odds_name.split(",")]
+    normalized = " ".join(reversed(parts)) if len(parts) == 2 else odds_name
+    norm = lambda s: re.sub(r"[^a-z0-9]", "", s.casefold())
+    matches = [p for p in directory if norm(p["full_name"]) == norm(normalized)]
+    return matches[0] if len(matches) == 1 else None
+
 
 st.title("🏀 NBA STATS 2.0")
-st.caption("Quote Bet365 Italia tramite OddsPapi · Linee principali e alternative")
-st.info("Le quote alternative vengono mostrate anche se OddsPapi indica il mercato come inattivo: controlla la colonna Stato API prima di utilizzarle.")
+st.caption("Quote Bet365 Italia tramite OddsPapi · Statistiche giocatori dal sito NBA ufficiale")
+st.info("Le quote alternative segnalate come inattive dall'API sono visibili per consultazione, ma la loro disponibilità va verificata su Bet365.")
 if not API_KEY:
-    st.error("Configura ODDSPAPI_API_KEY nei Secrets di Streamlit prima di proseguire.")
+    st.error("Configura ODDSPAPI_API_KEY nei Secrets di Streamlit.")
     st.stop()
-
-st.caption("Risparmio API: calendario 24 ore · catalogo mercati 7 giorni · quote 24 ore. "
-           "Cambiare giocatore o mercato non genera nuove richieste.")
 
 selected_date = st.date_input("Data delle partite (UTC)", value=datetime.now(timezone.utc).date())
 try:
     fixtures = get_fixtures(selected_date.isoformat())
-except (requests.RequestException, ValueError, RuntimeError) as exc:
-    st.error(f"Impossibile caricare le partite: {exc}")
+except (RuntimeError, ValueError) as exc:
+    st.error(f"Calendario non disponibile: {exc}")
     st.stop()
-
 if not fixtures:
-    st.warning("Nessuna partita NBA trovata per questa data. Prova un altro giorno.")
+    st.warning("Nessuna partita NBA trovata per questa data.")
     st.stop()
-
-options = {f"{f.get('participant1Name', '?')} – {f.get('participant2Name', '?')} | {f.get('startTime', '')[:16].replace('T', ' ')} UTC": f
-           for f in fixtures}
+options = {f"{f.get('participant1Name', '?')} – {f.get('participant2Name', '?')} | {str(f.get('startTime', ''))[:16].replace('T', ' ')} UTC": f for f in fixtures}
 choice = st.selectbox("🏟️ Partita NBA", list(options))
-fixture = options[choice]
-fixture_id = str(fixture["fixtureId"])
+fixture_id = str(options[choice]["fixtureId"])
 st.caption(f"Partite NBA trovate: {len(fixtures)}")
-
-# Nessuna richiesta alle quote finché l'utente non lo decide.
-# La selezione viene mantenuta per la sessione corrente e non passa a un'altra partita.
 if "loaded_fixture" not in st.session_state:
     st.session_state.loaded_fixture = None
-
-col_load, col_refresh = st.columns([2, 1])
-with col_load:
+if "odds_refresh_versions" not in st.session_state:
+    st.session_state.odds_refresh_versions = {}
+left, right = st.columns([2, 1])
+with left:
     if st.button("📥 Carica quote Bet365", type="primary"):
         st.session_state.loaded_fixture = fixture_id
-with col_refresh:
+with right:
     if st.button("🔄 Aggiorna quote della partita"):
-        revisions = st.session_state.setdefault("quote_revisions", {})
-        revisions[fixture_id] = revisions.get(fixture_id, 0) + 1
+        versions = st.session_state.odds_refresh_versions
+        versions[fixture_id] = versions.get(fixture_id, 0) + 1
         st.session_state.loaded_fixture = fixture_id
-
 if st.session_state.loaded_fixture != fixture_id:
-    st.info("Seleziona una partita e premi **Carica quote Bet365**. "
-            "Cambiare partita non scarica automaticamente le quote.")
+    st.info("Premi **Carica quote Bet365** per la partita selezionata. Il calendario non carica automaticamente le quote.")
     st.stop()
-
 market_label = st.selectbox("📊 Mercato giocatore", list(MARKETS))
 try:
     catalog = get_markets()
-    odds_data = get_odds(fixture_id, st.session_state.get("quote_revisions", {}).get(fixture_id, 0))
-    rows = parse_odds(odds_data, catalog, market_label)
-except (requests.RequestException, ValueError, RuntimeError) as exc:
-    st.error(f"Impossibile caricare le quote: {exc}")
+    odds = get_odds(fixture_id, st.session_state.odds_refresh_versions.get(fixture_id, 0))
+    rows, diag = parse_odds(odds, catalog, market_label)
+except (RuntimeError, ValueError) as exc:
+    st.error(f"Quote non disponibili: {exc}")
     st.stop()
-
 if not rows:
-    st.warning("Nessuna quota Bet365 Italia disponibile nel feed per questo mercato e questa partita.")
+    st.warning("Nessuna quota disponibile nel feed per questo mercato.")
     st.stop()
-
-players = sorted(set(r["Giocatore"] for r in rows))
-player_name = st.selectbox("🏀 Giocatore", players)
+player_name = st.selectbox("🏀 Giocatore", sorted({r["Giocatore"] for r in rows}))
 player_rows = [r for r in rows if r["Giocatore"] == player_name]
-
 st.subheader(f"{player_name} · {market_label}")
-st.caption("'Soglia +' indica un mercato solo Over (es. 20+ = Over 19,5). "
-           "'Mercato inattivo' indica che OddsPapi non conferma la disponibilità della quota; "
-           "verificala su Bet365. L'Under non viene inventato.")
+st.caption("'Soglia +' indica solo Over (20+ = Over 19,5). Nessuna quota Under viene inventata.")
 frame = pd.DataFrame(player_rows).sort_values("Linea")
 frame["Principale"] = frame["Principale"].map({True: "Sì", False: ""})
 st.dataframe(frame[["Linea", "Over", "Under", "Principale", "Tipo", "Stato API"]],
-             hide_index=True, use_container_width=True,
-             column_config={
-                 "Linea": st.column_config.NumberColumn("Linea", format="%.1f"),
-                 "Over": st.column_config.NumberColumn("Over", format="%.3f"),
-                 "Under": st.column_config.NumberColumn("Under", format="%.3f"),
-             })
+    hide_index=True, use_container_width=True,
+    column_config={"Linea": st.column_config.NumberColumn(format="%.1f"),
+                   "Over": st.column_config.NumberColumn(format="%.3f"),
+                   "Under": st.column_config.NumberColumn(format="%.3f")})
 st.download_button("⬇️ Scarica CSV quote", frame.to_csv(index=False).encode("utf-8-sig"),
                    file_name="nba_stats_quote.csv", mime="text/csv")
-with st.expander("🔎 Diagnostica mercati (nessuna richiesta API aggiuntiva)"):
-    stats, examples = market_diagnostics(odds_data, catalog, market_label, player_name)
-    st.json(stats)
-    if examples:
-        st.dataframe(pd.DataFrame(examples), hide_index=True, use_container_width=True)
-    st.caption("Questi dati sono calcolati esclusivamente dalla risposta OddsPapi già caricata. "
-               "Non vengono effettuate nuove chiamate API.")
-st.caption("Quote: cache 24 ore · Calendario: 24 ore · Catalogo: 7 giorni. "
-           "La cache può svuotarsi quando Streamlit riavvia l’app.")
+with st.expander("🔎 Diagnostica mercati (nessuna richiesta OddsPapi aggiuntiva)"):
+    st.json(diag)
+    st.caption("Dati ricavati dalla risposta OddsPapi già caricata.")
+
 st.divider()
-st.caption("NBA STATS 2.0 · Prototipo quote — statistiche storiche da integrare")
+st.subheader("📈 Statistiche ufficiali NBA — prima integrazione")
+st.caption("Le statistiche utilizzano nba_api e non consumano richieste OddsPapi. La disponibilità dipende dai server stats.nba.com.")
+season = st.selectbox("Stagione NBA", ["2026-27", "2025-26", "2024-25"])
+if st.button("📊 Carica statistiche NBA del giocatore"):
+    st.session_state.stats_selection = (player_name, season)
+if st.session_state.get("stats_selection") == (player_name, season):
+    try:
+        nba_player = match_nba_player(player_name, nba_player_directory())
+        if not nba_player:
+            st.warning("Nome giocatore non abbinato automaticamente all'anagrafica NBA. Non sono stati utilizzati dati di un altro giocatore.")
+        else:
+            log = nba_game_log(nba_player["id"], season)
+            if log.empty:
+                st.info("Nessuna partita di regular season disponibile per questo giocatore e questa stagione.")
+            else:
+                log = log.copy()
+                log["GAME_DATE"] = pd.to_datetime(log["GAME_DATE"], errors="coerce")
+                log = log.sort_values("GAME_DATE", ascending=False)
+                for col in ("PTS", "REB", "AST"):
+                    log[col] = pd.to_numeric(log[col], errors="coerce")
+                log["PRA"] = log["PTS"] + log["REB"] + log["AST"]
+                stat = STATS[market_label]
+                st.write(f"**{nba_player['full_name']} — {season} — {len(log)} partite**")
+                line = st.selectbox("Linea da analizzare", sorted(frame["Linea"].unique()), index=0)
+                columns = st.columns(3)
+                for column, count in zip(columns, (5, 10, 20)):
+                    subset = log.head(count)[stat].dropna()
+                    hits = int((subset > line).sum())
+                    column.metric(f"Ultime {count} (disponibili: {len(subset)})", f"{hits}/{len(subset)}", f"{hits / len(subset):.0%} Over" if len(subset) else None)
+                st.write(f"Media {stat} stagionale: **{log[stat].mean():.1f}**")
+                visible = log[["GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST", "PRA"]].copy()
+                visible["GAME_DATE"] = visible["GAME_DATE"].dt.strftime("%d/%m/%Y")
+                st.dataframe(visible, hide_index=True, use_container_width=True)
+    except Exception:
+        # NBA endpoints often time out or block cloud hosts. Avoid leaking URLs or internals.
+        st.error("Non è stato possibile recuperare le statistiche da stats.nba.com. Il servizio NBA potrebbe non rispondere ai server Streamlit Cloud. Le quote OddsPapi non sono coinvolte.")
+
+st.caption("Quote: cache 24 ore · Calendario: 24 ore · Catalogo: 7 giorni · Statistiche NBA: cache 6 ore. La cache può svuotarsi ai riavvii.")
