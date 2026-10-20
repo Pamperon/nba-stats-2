@@ -108,7 +108,10 @@ def market_diagnostics(odds_data, catalog, market_label, player_name=None):
 
 
 def parse_odds(odds_data, catalog, market_label):
-    """Legge linee Over/Under e soglie '20+' senza inventare Under o quote."""
+    """Include soglie alternative anche con marketActive=False, segnalandole.
+
+    Non trasforma mai una quota segnalata inattiva in una quota disponibile.
+    """
     bookmaker = (odds_data.get("bookmakerOdds") or {}).get("bet365.it") or {}
     if not bookmaker.get("bookmakerIsActive", False) or bookmaker.get("suspended", False):
         return []
@@ -118,9 +121,13 @@ def parse_odds(odds_data, catalog, market_label):
         definition = catalog.get(str(market_id))
         if not definition or definition.get("marketType") not in types:
             continue
-        if not market_data.get("marketActive", False):
-            continue
         market_type = definition["marketType"]
+        is_alternative = market_type.startswith("players-")
+        market_active = market_data.get("marketActive") is True
+        # Manteniamo il filtro originario per gli Over/Under normali.
+        # Le soglie alternative inattive restano consultabili ma segnalate.
+        if not market_active and not is_alternative:
+            continue
         outcome_names = {str(o["outcomeId"]): o.get("outcomeName", "")
                          for o in definition.get("outcomes", [])}
         for outcome_id, outcome in (market_data.get("outcomes") or {}).items():
@@ -128,42 +135,49 @@ def parse_odds(odds_data, catalog, market_label):
             if market_type.startswith("playertotals-"):
                 if name.lower() not in ("over", "under"):
                     continue
-                line = float(definition.get("handicap", 0))
+                try:
+                    line = float(definition["handicap"])
+                except (KeyError, TypeError, ValueError):
+                    continue
                 side = name.title()
-                label = f"{line:g}"
             else:
-                # Mercati 'players-points': es. 20+ significa almeno 20, equivalente a Over 19,5.
                 match = re.fullmatch(r"\s*(\d+)\+\s*", name)
                 if not match:
                     continue
                 line = int(match.group(1)) - 0.5
                 side = "Over"
-                label = f"{line:g}"
             for player_id, player in (outcome.get("players") or {}).items():
-                if not player.get("active") or not player.get("playerName"):
+                if player.get("active") is not True or not player.get("playerName"):
                     continue
                 price = player.get("price")
-                if not isinstance(price, (int, float)) or price <= 1:
+                if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 1:
                     continue
                 key = (str(player_id), line)
                 row = results.setdefault(key, {
                     "Giocatore": player["playerName"], "Linea": line,
                     "Over": None, "Under": None, "Principale": False,
-                    "Tipo": "Over/Under" if market_type.startswith("playertotals-") else "Soglia +",
+                    "Tipo": "Over/Under" if not is_alternative else "Soglia +",
+                    "Stato API": "Attivo" if market_active else "Mercato inattivo",
+                    "_side_active": {},
                 })
-                # In caso di duplicati, preferiamo il mercato Over/Under completo.
-                if row[side] is None or market_type.startswith("playertotals-"):
+                # Per duplicati privilegiamo la quota di un mercato attivo.
+                prior_active = row["_side_active"].get(side, False)
+                if row[side] is None or (market_active and not prior_active):
                     row[side] = price
+                    row["_side_active"][side] = market_active
                 if player.get("mainLine"):
                     row["Principale"] = True
-                if market_type.startswith("playertotals-"):
+                if not is_alternative:
                     row["Tipo"] = "Over/Under"
+                if any(row["_side_active"].values()):
+                    row["Stato API"] = "Attivo"
+    for row in results.values():
+        del row["_side_active"]
     return sorted(results.values(), key=lambda r: (r["Giocatore"], r["Linea"]))
-
 
 st.title("🏀 NBA STATS 2.0")
 st.caption("Quote Bet365 Italia tramite OddsPapi · Linee principali e alternative")
-st.info("Le quote cambiano nel tempo. Sono mostrate solo quelle restituite dall'API e contrassegnate come attive.")
+st.info("Le quote alternative vengono mostrate anche se OddsPapi indica il mercato come inattivo: controlla la colonna Stato API prima di utilizzarle.")
 if not API_KEY:
     st.error("Configura ODDSPAPI_API_KEY nei Secrets di Streamlit prima di proseguire.")
     st.stop()
@@ -219,7 +233,7 @@ except (requests.RequestException, ValueError, RuntimeError) as exc:
     st.stop()
 
 if not rows:
-    st.warning("Nessuna quota attiva Bet365 Italia per questo mercato e questa partita.")
+    st.warning("Nessuna quota Bet365 Italia disponibile nel feed per questo mercato e questa partita.")
     st.stop()
 
 players = sorted(set(r["Giocatore"] for r in rows))
@@ -227,11 +241,12 @@ player_name = st.selectbox("🏀 Giocatore", players)
 player_rows = [r for r in rows if r["Giocatore"] == player_name]
 
 st.subheader(f"{player_name} · {market_label}")
-st.caption("'Soglia +' indica un mercato solo Over (es. 20+ = almeno 20 punti = Over 19,5). "
-           "L'Under non viene inventato quando Bet365 non lo fornisce.")
+st.caption("'Soglia +' indica un mercato solo Over (es. 20+ = Over 19,5). "
+           "'Mercato inattivo' indica che OddsPapi non conferma la disponibilità della quota; "
+           "verificala su Bet365. L'Under non viene inventato.")
 frame = pd.DataFrame(player_rows).sort_values("Linea")
 frame["Principale"] = frame["Principale"].map({True: "Sì", False: ""})
-st.dataframe(frame[["Linea", "Over", "Under", "Principale", "Tipo"]],
+st.dataframe(frame[["Linea", "Over", "Under", "Principale", "Tipo", "Stato API"]],
              hide_index=True, use_container_width=True,
              column_config={
                  "Linea": st.column_config.NumberColumn("Linea", format="%.1f"),
