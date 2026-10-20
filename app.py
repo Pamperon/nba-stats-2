@@ -274,9 +274,9 @@ def espn_log_to_frame(data, season_type=2):
     if isinstance(metadata, list):
         metadata = {str(e.get("id")): e for e in metadata if isinstance(e, dict)}
     rows = []
-    for season_type in data.get("seasonTypes") or []:
-        type_id = str(season_type.get("id") or season_type.get("type") or "")
-        type_name = str(season_type.get("displayName") or season_type.get("name") or "").lower()
+    for season_group in data.get("seasonTypes") or []:
+        type_id = str(season_group.get("id") or season_group.get("type") or "")
+        type_name = str(season_group.get("displayName") or season_group.get("name") or "").lower()
         # ESPN season type 2 = regular season; 3 = postseason/playoffs.
         # When ESPN provides a numeric type, it takes precedence over the label.
         expected_words = ("regular",) if season_type == 2 else ("postseason", "post-season", "playoff")
@@ -285,7 +285,7 @@ def espn_log_to_frame(data, season_type=2):
                 continue
         elif not any(word in type_name for word in expected_words):
             continue
-        for category in season_type.get("categories") or []:
+        for category in season_group.get("categories") or []:
             if str(category.get("type", "")).lower() == "total":
                 continue
             # ESPN can provide labels per category, not just globally.
@@ -310,7 +310,7 @@ def espn_log_to_frame(data, season_type=2):
                 opp = opponent.get("abbreviation") or opponent.get("displayName") or "?"
                 rows.append({
                     "GAME_ID": event_id,
-                    "SEASON_TYPE": season_type,
+                    "SEASON_TYPE": int(season_type),
                     "GAME_DATE": espn_event_date(info) or espn_event_date(event),
                     "MATCHUP": f"{'@' if str(info.get('atVs', '')).strip() == '@' else 'vs'} {opp}",
                     "MIN": values[local_labels.index("MIN")] if "MIN" in local_labels else None,
@@ -382,7 +382,8 @@ def selected_game_log(athlete_id, season, mode):
     if not nonempty:
         return frames[0].copy()
     result = pd.concat(nonempty, ignore_index=True)
-    return result.drop_duplicates(subset=["GAME_ID"], keep="first")
+    result = result.drop_duplicates(subset=["GAME_ID"], keep="first")
+    return result
 
 
 st.title("🏀 NBA STATS 2.0")
