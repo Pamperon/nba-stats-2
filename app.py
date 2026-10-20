@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 import re
 import logging
+import traceback
 import pandas as pd
 import requests
 import streamlit as st
@@ -269,26 +270,32 @@ def espn_team_schedule(team_id, end_year, season_type=2):
 
 
 def espn_log_to_frame(data, season_type=2):
+    """Parse ESPN games, keeping their *actual* competition when identifiable."""
     labels = [str(x).strip().upper() for x in data.get("labels") or []]
     metadata = data.get("events") or {}
     if isinstance(metadata, list):
         metadata = {str(e.get("id")): e for e in metadata if isinstance(e, dict)}
+    if not isinstance(metadata, dict):
+        metadata = {}
     rows = []
-    for season_group in data.get("seasonTypes") or []:
-        type_id = str(season_group.get("id") or season_group.get("type") or "")
-        type_name = str(season_group.get("displayName") or season_group.get("name") or "").lower()
-        # ESPN season type 2 = regular season; 3 = postseason/playoffs.
-        # When ESPN provides a numeric type, it takes precedence over the label.
-        expected_words = ("regular",) if season_type == 2 else ("postseason", "post-season", "playoff")
-        if type_id in ("1", "2", "3", "4"):
-            if type_id != str(season_type):
-                continue
-        elif not any(word in type_name for word in expected_words):
+    for group in data.get("seasonTypes") or []:
+        if not isinstance(group, dict):
             continue
-        for category in season_group.get("categories") or []:
-            if str(category.get("type", "")).lower() == "total":
+        raw_type = group.get("id") or group.get("type")
+        if isinstance(raw_type, dict):
+            raw_type = raw_type.get("id") or raw_type.get("value")
+        group_name = str(group.get("displayName") or group.get("name") or "").lower()
+        group_type = None
+        if str(raw_type) in ("2", "3"):
+            group_type = int(raw_type)
+        elif "regular" in group_name:
+            group_type = 2
+        elif any(word in group_name for word in ("postseason", "post-season", "playoff")):
+            group_type = 3
+        # ESPN can ignore seasonType query. Never blindly label games as the requested type.
+        for category in group.get("categories") or []:
+            if not isinstance(category, dict) or str(category.get("type", "")).lower() == "total":
                 continue
-            # ESPN can provide labels per category, not just globally.
             local_labels = [str(x).strip().upper() for x in (category.get("labels") or labels)]
             if not all(x in local_labels for x in ("PTS", "REB", "AST")):
                 continue
@@ -301,7 +308,7 @@ def espn_log_to_frame(data, season_type=2):
                 event_id = str(event.get("eventId") or event.get("id") or "")
                 if not event_id:
                     continue
-                info = metadata.get(event_id, {})
+                info = metadata.get(event_id) or {}
                 if not isinstance(info, dict):
                     info = {}
                 opponent = info.get("opponent") or {}
@@ -310,7 +317,7 @@ def espn_log_to_frame(data, season_type=2):
                 opp = opponent.get("abbreviation") or opponent.get("displayName") or "?"
                 rows.append({
                     "GAME_ID": event_id,
-                    "SEASON_TYPE": int(season_type),
+                    "SEASON_TYPE": group_type,
                     "GAME_DATE": espn_event_date(info) or espn_event_date(event),
                     "MATCHUP": f"{'@' if str(info.get('atVs', '')).strip() == '@' else 'vs'} {opp}",
                     "MIN": values[local_labels.index("MIN")] if "MIN" in local_labels else None,
@@ -374,16 +381,39 @@ def espn_game_log(athlete_id, season, season_type=2):
     return espn_log_to_frame(payload, season_type=season_type)
 
 
-def selected_game_log(athlete_id, season, mode):
-    """Fetch only the selected competition; merge without duplicating event IDs."""
+def selected_game_log(athlete_id, season, mode, team_id=None):
+    """Separate games by ESPN's season grouping and independent team schedules."""
     kinds = [2, 3] if mode == "Regular season + Playoff" else ([3] if mode == "Playoff" else [2])
-    frames = [espn_game_log(athlete_id, season, kind) for kind in kinds]
-    nonempty = [frame for frame in frames if not frame.empty]
-    if not nonempty:
-        return frames[0].copy()
-    result = pd.concat(nonempty, ignore_index=True)
-    result = result.drop_duplicates(subset=["GAME_ID"], keep="first")
-    return result
+    end_year = int(season[:4]) + 1
+    schedules = {}
+    if team_id:
+        for kind in (2, 3):
+            try:
+                schedules[kind] = espn_team_schedule(team_id, end_year, kind)
+            except requests.RequestException:
+                schedules[kind] = {}
+    # Schedules only identify competition if their event IDs differ.
+    regular_ids = set(schedules.get(2, {})) - set(schedules.get(3, {}))
+    playoff_ids = set(schedules.get(3, {})) - set(schedules.get(2, {}))
+    frames = []
+    for kind in kinds:
+        frame = espn_game_log(athlete_id, season, kind).copy()
+        if frame.empty:
+            continue
+        for idx, row in frame.iterrows():
+            eid = str(row["GAME_ID"])
+            if eid in regular_ids:
+                frame.at[idx, "SEASON_TYPE"] = 2
+            elif eid in playoff_ids:
+                frame.at[idx, "SEASON_TYPE"] = 3
+        # Games with unverified competition are omitted rather than mislabeled.
+        frame = frame.loc[frame["SEASON_TYPE"].eq(kind)].copy()
+        if not frame.empty:
+            frames.append(frame)
+    if not frames:
+        return pd.DataFrame(columns=["GAME_ID", "SEASON_TYPE", "GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"])
+    result = pd.concat(frames, ignore_index=True)
+    return result.drop_duplicates(subset=["GAME_ID"], keep="first").reset_index(drop=True)
 
 
 st.title("🏀 NBA STATS 2.0")
@@ -469,7 +499,7 @@ if st.session_state.get("stats_selection") == (player_name, season, competition_
                 st.json({"Giocatore cercato": player_name, "Nome normalizzato": normalized_name(player_name), **matching_diagnostics})
         else:
             diagnostic_stage = "Recupero storico partite da ESPN"
-            log = selected_game_log(nba_player["id"], season, competition_mode)
+            log = selected_game_log(nba_player["id"], season, competition_mode, nba_player.get("team_id"))
             diagnostic_stage = "Elaborazione e visualizzazione statistiche"
             if log.empty:
                 st.info(f"Nessuna partita disponibile in modalità {competition_mode} per questo giocatore e questa stagione.")
@@ -482,7 +512,7 @@ if st.session_state.get("stats_selection") == (player_name, season, competition_
                 line = st.selectbox("Linea da analizzare", sorted(frame["Linea"].unique()), index=0)
                 # The previous season is loaded only when the user requests the analysis.
                 previous_season = f"{int(season[:4])-1}-{str(int(season[:4]))[-2:]}"
-                previous_log = selected_game_log(nba_player["id"], previous_season, competition_mode)
+                previous_log = selected_game_log(nba_player["id"], previous_season, competition_mode, nba_player.get("team_id"))
                 if not previous_log.empty:
                     previous_log = prepare_game_log(previous_log, nba_player.get("team_id"), previous_season, require_dates=False)
                 missing_dates = int(log["GAME_DATE"].isna().sum())
@@ -543,8 +573,16 @@ if st.session_state.get("stats_selection") == (player_name, season, competition_
         if not isinstance(status, int):
             status = None
         error_type = type(exc).__name__
-        logger.error("NBA diagnostics: stage=%s type=%s http_status=%s", diagnostic_stage, error_type, status)
+        # Show the exact failing source line, without exposing request URLs or secrets.
+        frames_trace = traceback.extract_tb(exc.__traceback__)
+        own_frames = [f for f in frames_trace if f.filename.endswith("app.py") or "app_nba_stats" in f.filename]
+        failure = own_frames[-1] if own_frames else (frames_trace[-1] if frames_trace else None)
+        failure_location = f"Riga {failure.lineno} · funzione {failure.name}" if failure else "Non disponibile"
+        logger.error("NBA diagnostics: stage=%s type=%s http_status=%s location=%s", diagnostic_stage, error_type, status, failure_location)
         st.error("Impossibile completare l'analisi ESPN. Le quote OddsPapi non sono coinvolte.")
+        st.caption(f"Punto del problema: **{failure_location}**")
+        if isinstance(exc, TypeError):
+            st.warning(f"Dettaglio TypeError: {str(exc)[:250]}")
         if isinstance(exc, ValueError):
             # Only locally constructed validation errors, never raw request URLs.
             st.warning(f"Dettaglio verifica dati: {str(exc)[:350]}")
@@ -552,7 +590,7 @@ if st.session_state.get("stats_selection") == (player_name, season, competition_
             st.json({"Fase": diagnostic_stage, "Tipo errore": error_type,
                      "Stato HTTP": status if status is not None else "Non disponibile",
                      "Giocatore": player_name, "Stagione": season,
-                     "Fonte": "ESPN (gratuita)"})
+                     "Fonte": "ESPN (gratuita)", "Punto errore": failure_location})
             st.caption("Questi dettagli sono ricavati dall'errore già avvenuto: non viene eseguito alcun nuovo test di rete. Non condividere eventuali credenziali presenti in altri log.")
 
 st.caption("Quote: cache 24 ore · Calendario: 24 ore · Catalogo: 7 giorni · Statistiche ESPN: cache 6 ore. La cache può svuotarsi ai riavvii.")
