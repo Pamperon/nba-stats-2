@@ -19,15 +19,17 @@ STATS = {"Punti (PTS)": "PTS", "Rimbalzi (REB)": "REB", "Assist (AST)": "AST"}
 # Soglie alternative Bet365 verificate dall'utente. Il mercato principale
 # Over/Under può usare linee diverse e viene conservato separatamente.
 BET365_ALT_LINES = {
-    "PTS": {0.5} | {float(n) + 0.5 for n in range(4, 100, 5)},
-    "REB": {0.5, 2.5, 4.5, 6.5, 9.5, 12.5, 14.5, 16.5, 19.5},
-    "AST": {0.5, 2.5, 4.5, 6.5, 9.5, 12.5, 14.5},
+    "PTS": {float(n) + 0.5 for n in range(4, 100, 5)},
+    "REB": {2.5, 4.5, 6.5, 9.5, 12.5, 14.5, 16.5, 19.5},
+    "AST": {2.5, 4.5, 6.5, 9.5, 12.5, 14.5},
 }
 
 
 def bet365_line_allowed(row, stat):
     # Le soglie fornite si riferiscono ai mercati alternativi (+).
     # Le linee principali Over/Under non devono essere eliminate per errore.
+    if abs(float(row["Linea"]) - 0.5) < 1e-6:
+        return False
     if row.get("Tipo") == "Over/Under":
         return True
     return round(float(row["Linea"]), 2) in BET365_ALT_LINES[stat]
@@ -671,7 +673,13 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
                 for row in parsed:
                     grouped.setdefault(row["Giocatore"], []).append(row)
                 for player_name, group in grouped.items():
-                    filtered, excluded = auto_filter_suspicious_lines(group)
+                    removed_half = [r for r in group if abs(float(r["Linea"]) - 0.5) < 1e-6]
+                    for row in removed_half:
+                        filter_audit.append({"Partita": match_name, "Giocatore": player_name,
+                                             "Mercato": STATS[market_label], "Linea": row["Linea"],
+                                             "Motivo": "Linea 0,5 esclusa per scelta: non disponibile su Bet365"})
+                    filtered, excluded = auto_filter_suspicious_lines(
+                        [r for r in group if abs(float(r["Linea"]) - 0.5) >= 1e-6])
                     for row in excluded:
                         filter_audit.append({"Partita": match_name, "Giocatore": player_name,
                                              "Mercato": STATS[market_label], "Linea": row["Linea"],
@@ -866,7 +874,11 @@ player_name = st.selectbox("🏀 Giocatore", sorted({r["Giocatore"] for r in row
 player_rows = [r for r in rows if r["Giocatore"] == player_name]
 st.subheader(f"{player_name} · {market_label}")
 st.caption("Le soglie '+' mostrano soltanto la quota Over (20+ = Over 19,5). Nessuna quota Under viene inventata.")
-st.caption("Controllo automatico attivo: se una soglia inferiore ha una quota Over maggiore della successiva, viene esclusa. La disponibilità su Bet365 non è garantita.")
+st.caption("Controllo automatico attivo: linea 0,5 sempre esclusa; se una soglia inferiore ha una quota Over maggiore della successiva, viene esclusa. La disponibilità su Bet365 non è garantita.")
+removed_half = [r for r in player_rows if abs(float(r["Linea"]) - 0.5) < 1e-6]
+player_rows = [r for r in player_rows if abs(float(r["Linea"]) - 0.5) >= 1e-6]
+if removed_half:
+    st.caption(f"Escluse {len(removed_half)} linee 0,5 (non disponibili su Bet365 secondo la verifica effettuata).")
 player_rows, excluded_rows = auto_filter_suspicious_lines(player_rows)
 if excluded_rows:
     st.caption(f"Escluse automaticamente {len(excluded_rows)} linee con quote Over incoerenti.")
