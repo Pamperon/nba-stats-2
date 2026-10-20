@@ -222,7 +222,7 @@ def match_espn_player(name, home_team, away_team, end_year):
                 if len(sample_names) < 8:
                     sample_names.append(full_name)
                 if normalized_name(full_name) == target:
-                    return {"id": athlete["id"], "full_name": full_name}, {
+                    return {"id": athlete["id"], "full_name": full_name, "team_id": team_id}, {
                         "Rose controllate": checked,
                         "Rose non raggiungibili": failed,
                         "Atleti letti": athletes_seen,
@@ -238,10 +238,38 @@ def match_espn_player(name, home_team, away_team, end_year):
     }
 
 
+def espn_event_date(info):
+    """Extract a real date only; never infer a date from row position."""
+    if not isinstance(info, dict):
+        return None
+    for key in ("date", "gameDate", "startDate", "startTime"):
+        if info.get(key):
+            return info[key]
+    for competition in info.get("competitions") or []:
+        if isinstance(competition, dict):
+            found = espn_event_date(competition)
+            if found:
+                return found
+    return None
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def espn_team_schedule(team_id, end_year):
+    """One ESPN schedule request supplies game dates for an entire season."""
+    payload = espn_json(f"{ESPN_SITE}/teams/{team_id}/schedule", season=end_year, seasontype=2)
+    dates = {}
+    for event in payload.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        event_id = str(event.get("id") or "")
+        date = espn_event_date(event)
+        if event_id and date:
+            dates[event_id] = date
+    return dates
+
+
 def espn_log_to_frame(data):
-    labels = [str(x).upper() for x in data.get("labels", [])]
-    if not all(x in labels for x in ("PTS", "REB", "AST")):
-        raise ValueError("ESPN: mancano le colonne PTS/REB/AST nello storico")
+    labels = [str(x).strip().upper() for x in data.get("labels") or []]
     metadata = data.get("events") or {}
     if isinstance(metadata, list):
         metadata = {str(e.get("id")): e for e in metadata if isinstance(e, dict)}
@@ -256,31 +284,79 @@ def espn_log_to_frame(data):
         for category in season_type.get("categories") or []:
             if str(category.get("type", "")).lower() == "total":
                 continue
+            # ESPN can provide labels per category, not just globally.
+            local_labels = [str(x).strip().upper() for x in (category.get("labels") or labels)]
+            if not all(x in local_labels for x in ("PTS", "REB", "AST")):
+                continue
             for event in category.get("events") or []:
                 if not isinstance(event, dict):
                     continue
                 values = event.get("stats") or []
-                if not isinstance(values, list) or len(values) != len(labels):
+                if not isinstance(values, list) or len(values) != len(local_labels):
                     continue
                 event_id = str(event.get("eventId") or event.get("id") or "")
+                if not event_id:
+                    continue
                 info = metadata.get(event_id, {})
                 if not isinstance(info, dict):
                     info = {}
                 opponent = info.get("opponent") or {}
+                if not isinstance(opponent, dict):
+                    opponent = {}
                 opp = opponent.get("abbreviation") or opponent.get("displayName") or "?"
                 rows.append({
                     "GAME_ID": event_id,
-                    "GAME_DATE": info.get("date") or event.get("date"),
+                    "GAME_DATE": espn_event_date(info) or espn_event_date(event),
                     "MATCHUP": f"{'@' if str(info.get('atVs', '')).strip() == '@' else 'vs'} {opp}",
-                    "MIN": values[labels.index("MIN")] if "MIN" in labels else None,
-                    "PTS": values[labels.index("PTS")],
-                    "REB": values[labels.index("REB")],
-                    "AST": values[labels.index("AST")],
+                    "MIN": values[local_labels.index("MIN")] if "MIN" in local_labels else None,
+                    "PTS": values[local_labels.index("PTS")],
+                    "REB": values[local_labels.index("REB")],
+                    "AST": values[local_labels.index("AST")],
                 })
     frame = pd.DataFrame(rows, columns=["GAME_ID", "GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"])
     if not frame.empty:
         frame = frame.drop_duplicates(subset=["GAME_ID"], keep="first")
     return frame
+
+
+def prepare_game_log(log, team_id, season, require_dates=True):
+    """Complete and verify dates before calculating last-N statistics."""
+    log = log.copy()
+    if log.empty:
+        return log
+    dates = pd.to_datetime(log["GAME_DATE"], errors="coerce", utc=True)
+    if dates.isna().any() and team_id:
+        schedule = espn_team_schedule(team_id, int(season[:4]) + 1)
+        replacement = pd.to_datetime(log["GAME_ID"].astype(str).map(schedule), errors="coerce", utc=True)
+        dates = dates.fillna(replacement)
+    log["GAME_DATE"] = dates
+    if dates.isna().any() and require_dates:
+        raise ValueError(f"Date non disponibili per {int(dates.isna().sum())} partite: impossibile verificare le ultime 5/10/20.")
+    for col in ("PTS", "REB", "AST"):
+        log[col] = pd.to_numeric(log[col], errors="coerce")
+    if log[["PTS", "REB", "AST"]].isna().any().any():
+        raise ValueError("Statistiche ESPN incomplete o non numeriche: analisi sospesa.")
+    if (log[["PTS", "REB", "AST"]] < 0).any().any():
+        raise ValueError("Statistiche ESPN non valide: valori negativi.")
+    log["PRA"] = log["PTS"] + log["REB"] + log["AST"]
+    return log.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+
+
+def analysis_row(title, data, stat, line):
+    values = data[stat].dropna()
+    n = len(values)
+    over = int((values > line).sum())
+    under = int((values < line).sum())
+    push = n - over - under
+    row = {"Periodo": title, "Partite": n, "Over": f"{over}/{n}" if n else "—",
+           "% Over": f"{over/n:.1%}" if n else "—",
+           "Under": f"{under}/{n}" if n else "—",
+           "% Under": f"{under/n:.1%}" if n else "—",
+           "Media": f"{values.mean():.1f}" if n else "—",
+           "Media - linea": f"{values.mean()-line:+.1f}" if n else "—"}
+    if push:
+        row["Push"] = push
+    return row
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Recupero storico ESPN…")
@@ -376,24 +452,53 @@ if st.session_state.get("stats_selection") == (player_name, season):
             if log.empty:
                 st.info("Nessuna partita di regular season disponibile per questo giocatore e questa stagione.")
             else:
-                log = log.copy()
-                log["GAME_DATE"] = pd.to_datetime(log["GAME_DATE"], errors="coerce")
-                log = log.sort_values("GAME_DATE", ascending=False)
-                for col in ("PTS", "REB", "AST"):
-                    log[col] = pd.to_numeric(log[col], errors="coerce")
-                log["PRA"] = log["PTS"] + log["REB"] + log["AST"]
+                log = prepare_game_log(log, nba_player.get("team_id"), season)
                 stat = STATS[market_label]
                 st.write(f"**{nba_player['full_name']} — {season} — {len(log)} partite**")
                 line = st.selectbox("Linea da analizzare", sorted(frame["Linea"].unique()), index=0)
-                columns = st.columns(3)
-                for column, count in zip(columns, (5, 10, 20)):
-                    subset = log.head(count)[stat].dropna()
-                    hits = int((subset > line).sum())
-                    column.metric(f"Ultime {count} (disponibili: {len(subset)})", f"{hits}/{len(subset)}", f"{hits / len(subset):.0%} Over" if len(subset) else None)
-                st.write(f"Media {stat} stagionale: **{log[stat].mean():.1f}**")
+                # The previous season is loaded only when the user requests the analysis.
+                previous_season = f"{int(season[:4])-1}-{str(int(season[:4]))[-2:]}"
+                previous_log = espn_game_log(nba_player["id"], previous_season)
+                if not previous_log.empty:
+                    previous_log = prepare_game_log(previous_log, nba_player.get("team_id"), previous_season, require_dates=False)
+                periods = [("Ultime 5", log.head(5)), ("Ultime 10", log.head(10)),
+                           ("Ultime 20", log.head(20)), (f"Stagione {season}", log),
+                           (f"Stagione {previous_season}", previous_log)]
+                st.caption(f"Linea {line:g} · Over: risultato > {line:g} · Under: risultato < {line:g}")
+                for period_title, period_log in periods:
+                    values = period_log[stat].dropna() if not period_log.empty else pd.Series(dtype=float)
+                    count = len(values)
+                    over = int((values > line).sum())
+                    under = int((values < line).sum())
+                    pushes = count - over - under
+                    with st.container(border=True):
+                        first, second = st.columns([2, 1])
+                        with first:
+                            st.write(f"**{period_title}** · {count} partite")
+                            if count:
+                                st.markdown(
+                                    f'<span style="display:inline-block;background:#dcfce7;color:#166534;padding:5px 12px;border-radius:20px;margin-right:8px;font-weight:600">'
+                                    f'↑ {over/count:.0%} Over ({over}/{count})</span>'
+                                    f'<span style="display:inline-block;background:#fee2e2;color:#991b1b;padding:5px 12px;border-radius:20px;font-weight:600">'
+                                    f'↓ {under/count:.0%} Under ({under}/{count})</span>',
+                                    unsafe_allow_html=True,
+                                )
+                                if pushes:
+                                    st.caption(f"Push: {pushes} (risultato esattamente uguale alla linea)")
+                            else:
+                                st.caption("Nessuna partita disponibile")
+                        with second:
+                            if count:
+                                st.metric(f"Media {stat}", f"{values.mean():.1f}",
+                                          f"{values.mean()-line:+.1f} rispetto alla linea")
+                st.subheader(f"Dettaglio partite — {season}")
                 visible = log[["GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST", "PRA"]].copy()
                 visible["GAME_DATE"] = visible["GAME_DATE"].dt.strftime("%d/%m/%Y")
                 st.dataframe(visible, hide_index=True, width="stretch")
+                with st.expander("📊 Riepilogo comparativo"):
+                    st.dataframe(pd.DataFrame([analysis_row(title, games, stat, line)
+                                               for title, games in periods]), hide_index=True, width="stretch")
+
     except Exception as exc:
         # Never display or log raw exception text: request exceptions can contain URLs.
         # Only publish the stage, exception class, and numeric HTTP status if present.
