@@ -532,6 +532,182 @@ def auto_filter_suspicious_lines(player_rows):
     return ordered[reset_at:], ordered[:reset_at]
 
 
+
+
+def finder_estimate_probability(log, stat, line, side):
+    """Heuristic, regular-season only. Not a calibrated predictive model."""
+    if log.empty or stat not in log.columns:
+        return None
+    log = log.copy()
+    log[stat] = pd.to_numeric(log[stat], errors="coerce")
+    log["GAME_DATE"] = pd.to_datetime(log["GAME_DATE"], errors="coerce", utc=True)
+    log = log.dropna(subset=[stat, "GAME_DATE"]).sort_values("GAME_DATE", ascending=False)
+    if len(log) < 15:
+        return None
+    values = log[stat]
+    # Half-point markets have no pushes. Skip other lines to avoid settlement ambiguity.
+    if abs(line % 1 - 0.5) > 1e-6:
+        return None
+    wins = (values > line) if side == "Over" else (values < line)
+    season_rate = float(wins.mean())
+    recent = wins.head(min(20, len(wins)))
+    recent_rate = float(recent.mean())
+    # Bayesian smoothing toward 50% plus modest recency adjustment.
+    # This is a ranking heuristic, NOT a statistically calibrated probability.
+    smooth = (float(wins.sum()) + 12.0) / (len(wins) + 24.0)
+    estimate = 0.75 * smooth + 0.25 * recent_rate
+    return {"estimate": estimate, "season": season_rate, "recent": recent_rate,
+            "n": len(wins), "n_recent": len(recent), "recent_hits": int(recent.sum()),
+            "avg": float(values.mean())}
+
+
+def finder_player_index(end_year):
+    """Read all current ESPN rosters once; return normalized-name lookup."""
+    index = {}
+    for entry in espn_teams():
+        team = entry.get("team", entry)
+        team_id = str(team.get("id") or "")
+        if not team_id:
+            continue
+        try:
+            roster = espn_roster(team_id, None)
+        except requests.RequestException:
+            continue
+        for athlete in roster_athletes(roster):
+            index.setdefault(normalized_name(athlete["displayName"]),
+                             {"id": athlete["id"], "team_id": team_id,
+                              "full_name": athlete["displayName"]})
+    return index
+
+
+def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
+                min_value, progress_callback=None):
+    """One cached OddsPapi odds request per fixture, four markets per response.
+
+    ESPN classification is cached per athlete/season and reused for all markets.
+    """
+    results, issues = [], []
+    players_index = finder_player_index(int(season[:4]) + 1)
+    odds_rows = []
+    for idx, fixture in enumerate(fixtures):
+        fid = str(fixture["fixtureId"])
+        match_name = f"{fixture.get('participant1Name', '?')} - {fixture.get('participant2Name', '?')}"
+        if progress_callback:
+            progress_callback(idx / max(len(fixtures), 1) * 0.25, f"Quote: {match_name}")
+        try:
+            odds = get_odds(fid, st.session_state.odds_refresh_versions.get(fid, 0))
+            for market_label in MARKETS:
+                parsed, _ = parse_odds(odds, catalog, market_label)
+                grouped = {}
+                for row in parsed:
+                    grouped.setdefault(row["Giocatore"], []).append(row)
+                for player_name, group in grouped.items():
+                    filtered, _ = auto_filter_suspicious_lines(group)
+                    for row in filtered:
+                        for side in ("Over", "Under"):
+                            price = row.get(side)
+                            if isinstance(price, (int, float)) and odds_min <= price <= odds_max:
+                                odds_rows.append((match_name, player_name, market_label, row["Linea"], side, float(price)))
+        except Exception as exc:
+            issues.append(f"Quote non disponibili per {match_name}: {type(exc).__name__}")
+    # Process each athlete only once, regardless of number of props and lines.
+    grouped_props = {}
+    for match_name, player_name, market_label, line, side, price in odds_rows:
+        grouped_props.setdefault(player_name, []).append((match_name, market_label, line, side, price))
+    total = len(grouped_props)
+    for idx, (player_name, props) in enumerate(grouped_props.items()):
+        if progress_callback:
+            progress_callback(0.25 + 0.75 * idx / max(total, 1),
+                              f"ESPN: {idx + 1}/{total} giocatori — {player_name}")
+        athlete = players_index.get(normalized_name(player_name))
+        if athlete is None:
+            issues.append(f"Giocatore non identificato: {player_name}")
+            continue
+        try:
+            games = selected_game_log(athlete["id"], season, "Regular season", athlete["team_id"])
+            if games.empty:
+                continue
+            games = prepare_game_log(games, athlete["team_id"], season, require_dates=False)
+        except Exception as exc:
+            issues.append(f"Statistiche non disponibili: {player_name} ({type(exc).__name__})")
+            continue
+        if games["GAME_DATE"].isna().any() or len(games) < min_games:
+            continue
+        for match_name, market_label, line, side, price in props:
+            stat = STATS[market_label]
+            estimate = finder_estimate_probability(games, stat, float(line), side)
+            if not estimate or estimate["n"] < min_games:
+                continue
+            ev = estimate["estimate"] * price - 1.0
+            if ev < min_value / 100.0:
+                continue
+            results.append({
+                "Partita": match_name, "Giocatore": player_name,
+                "Mercato": stat, "Scelta": side, "Linea": float(line),
+                "Quota": price, "Prob. stimata %": round(100 * estimate["estimate"], 1),
+                "Prob. implicita %": round(100 / price, 1),
+                "Value stimato %": round(100 * ev, 1),
+                "Ultime 20": f"{estimate['recent_hits']}/{estimate['n_recent']}",
+                "Stagione %": round(100 * estimate["season"], 1),
+                "Partite": estimate["n"], "Media": round(estimate["avg"], 1),
+            })
+    if progress_callback:
+        progress_callback(1.0, "Analisi completata")
+    results.sort(key=lambda x: (x["Value stimato %"], x["Partite"]), reverse=True)
+    return results, issues, len(odds_rows), total
+
+
+def render_value_finder(fixtures, selected_date):
+    st.subheader("🔎 NBA Value Finder — opportunità della giornata")
+    st.info("Classifica sperimentale basata sui risultati passati: non è una previsione affidabile né una garanzia di valore reale. Le quote potrebbero essere cambiate.")
+    st.caption("La scansione usa le quote OddsPapi delle partite selezionate e le statistiche ESPN di regular season. Una richiesta quote per partita non già in cache; nessun aggiornamento automatico.")
+    season = st.selectbox("Stagione da analizzare", ["2026-27", "2025-26", "2024-25"], index=1, key="finder_season")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        min_games = st.number_input("Partite minime", min_value=10, max_value=60, value=20, step=5)
+    with c2:
+        odds_min = st.number_input("Quota minima", min_value=1.01, max_value=10.0, value=1.50, step=0.05)
+    with c3:
+        odds_max = st.number_input("Quota massima", min_value=1.01, max_value=20.0, value=3.00, step=0.10)
+    min_value = st.slider("Value stimato minimo (%)", min_value=0, max_value=50, value=5, step=1)
+    st.caption("Il value è una stima euristica: usa frequenze stagionali corrette verso il 50% e andamento recente. Non include infortuni, avversario, quintetti o casa/trasferta.")
+    if odds_min > odds_max:
+        st.warning("La quota minima deve essere inferiore o uguale alla quota massima.")
+        return
+    if st.button(f"🔍 Analizza tutte le {len(fixtures)} partite", type="primary", key="finder_start"):
+        st.session_state.pop("finder_results", None)
+        progress = st.progress(0, text="Preparazione analisi…")
+        try:
+            catalog = get_markets()
+            results, issues, odds_count, player_count = finder_scan(
+                fixtures, catalog, season, int(min_games), float(odds_min), float(odds_max),
+                int(min_value), lambda p, t: progress.progress(min(1.0, max(0.0, p)), text=t))
+            st.session_state.finder_results = {
+                "date": str(selected_date), "season": season,
+                "results": results, "issues": issues,
+                "odds_count": odds_count, "player_count": player_count,
+            }
+        except Exception as exc:
+            st.error(f"Scansione interrotta ({type(exc).__name__}). Le quote già in cache restano disponibili.")
+        finally:
+            progress.empty()
+    saved = st.session_state.get("finder_results")
+    if not saved or saved["date"] != str(selected_date) or saved["season"] != season:
+        return
+    st.caption(f"Quote candidate: {saved['odds_count']} · Giocatori esaminati: {saved['player_count']} · Segnalazioni: {len(saved['issues'])}")
+    if saved["results"]:
+        df = pd.DataFrame(saved["results"])
+        st.write(f"**{len(df)} opportunità individuate** (ordinate per value stimato)")
+        st.dataframe(df, hide_index=True, width="stretch")
+        st.download_button("⬇️ Scarica risultati CSV", df.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="nba_value_finder.csv", mime="text/csv")
+    else:
+        st.warning("Nessuna opportunità supera i filtri, oppure i dati ESPN disponibili sono insufficienti.")
+    if saved["issues"]:
+        with st.expander(f"⚠️ Dettagli: {len(saved['issues'])} giocatori/partite non elaborati"):
+            st.write("\n".join(f"- {issue}" for issue in saved["issues"][:100]))
+
+
 st.title("🏀 NBA STATS 2.0")
 st.caption("Quote Bet365 Italia tramite OddsPapi · Statistiche NBA da ESPN (fonte gratuita)")
 st.info("Le quote provengono da OddsPapi. Il filtro automatico esclude alcune linee sospette, ma la disponibilità effettiva va verificata su Bet365.")
@@ -552,6 +728,13 @@ options = {f"{f.get('participant1Name', '?')} – {f.get('participant2Name', '?'
 choice = st.selectbox("🏟️ Partita NBA", list(options))
 fixture_id = str(options[choice]["fixtureId"])
 st.caption(f"Partite NBA trovate: {len(fixtures)}")
+section = st.radio("Sezione", ["📊 Analisi singola partita", "🔎 NBA Value Finder"], horizontal=True)
+if section == "🔎 NBA Value Finder":
+    if "odds_refresh_versions" not in st.session_state:
+        st.session_state.odds_refresh_versions = {}
+    render_value_finder(fixtures, selected_date)
+    st.stop()
+
 if "loaded_fixture" not in st.session_state:
     st.session_state.loaded_fixture = None
 if "odds_refresh_versions" not in st.session_state:
