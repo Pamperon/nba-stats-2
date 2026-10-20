@@ -14,9 +14,25 @@ MARKETS = {
     "Punti (PTS)": ("playertotals-points", "players-points"),
     "Rimbalzi (REB)": ("playertotals-rebounds", "players-rebounds"),
     "Assist (AST)": ("playertotals-assists", "players-assists"),
-    "Punti + Rimbalzi + Assist (PRA)": ("playertotals-ptsassreb", "players-ptsassreb"),
 }
-STATS = {"Punti (PTS)": "PTS", "Rimbalzi (REB)": "REB", "Assist (AST)": "AST", "Punti + Rimbalzi + Assist (PRA)": "PRA"}
+STATS = {"Punti (PTS)": "PTS", "Rimbalzi (REB)": "REB", "Assist (AST)": "AST"}
+# Soglie alternative Bet365 verificate dall'utente. Il mercato principale
+# Over/Under può usare linee diverse e viene conservato separatamente.
+BET365_ALT_LINES = {
+    "PTS": {0.5} | {float(n) + 0.5 for n in range(4, 100, 5)},
+    "REB": {0.5, 2.5, 4.5, 6.5, 9.5, 12.5, 14.5, 16.5, 19.5},
+    "AST": {0.5, 2.5, 4.5, 6.5, 9.5, 12.5, 14.5},
+}
+
+
+def bet365_line_allowed(row, stat):
+    # Le soglie fornite si riferiscono ai mercati alternativi (+).
+    # Le linee principali Over/Under non devono essere eliminate per errore.
+    if row.get("Tipo") == "Over/Under":
+        return True
+    return round(float(row["Linea"]), 2) in BET365_ALT_LINES[stat]
+
+
 try:
     API_KEY = st.secrets["ODDSPAPI_API_KEY"]
 except (KeyError, FileNotFoundError):
@@ -354,7 +370,6 @@ def prepare_game_log(log, team_id, season, require_dates=True):
         raise ValueError("Statistiche ESPN incomplete o non numeriche: analisi sospesa.")
     if (log[["PTS", "REB", "AST"]] < 0).any().any():
         raise ValueError("Statistiche ESPN non valide: valori negativi.")
-    log["PRA"] = log["PTS"] + log["REB"] + log["AST"]
     return log.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
 
 
@@ -636,7 +651,7 @@ def odds_source_audit(odds, catalog, match_name):
 
 def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
                 min_value, progress_callback=None):
-    """One cached OddsPapi odds request per fixture, four markets per response.
+    """One cached OddsPapi odds request per fixture, three markets per response.
 
     ESPN classification is cached per athlete/season and reused for all markets.
     """
@@ -665,6 +680,11 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
                                              "Mercato": STATS[market_label], "Linea": row["Linea"],
                                              "Motivo": "Inversione significativa quote Over (euristica)"})
                     for row in filtered:
+                        if not bet365_line_allowed(row, STATS[market_label]):
+                            filter_audit.append({"Partita": match_name, "Giocatore": player_name,
+                                                 "Mercato": STATS[market_label], "Linea": row["Linea"],
+                                                 "Motivo": "Soglia alternativa fuori schema Bet365 verificato"})
+                            continue
                         for side in ("Over", "Under"):
                             price = row.get(side)
                             if isinstance(price, (int, float)) and odds_min <= price <= odds_max:
@@ -759,7 +779,7 @@ def render_value_finder(fixtures, selected_date):
     if not saved or saved["date"] != str(selected_date) or saved["season"] != season:
         return
     st.caption(f"Quote candidate: {saved['odds_count']} · Giocatori esaminati: {saved['player_count']} · "
-               f"Linee escluse per inversione quote: {len(saved.get('filter_audit', []))} · "
+               f"Linee escluse dai controlli: {len(saved.get('filter_audit', []))} · "
                f"Segnalazioni: {len(saved['issues'])}")
     if saved["results"]:
         df = pd.DataFrame(saved["results"])
@@ -784,7 +804,7 @@ def render_value_finder(fixtures, selected_date):
         else:
             st.info("Nessun esito disponibile per la diagnostica.")
         if saved.get("filter_audit"):
-            st.write("**Linee escluse dal controllo di coerenza delle quote:**")
+            st.write("**Linee escluse dai controlli (coerenza e schema):**")
             st.dataframe(pd.DataFrame(saved["filter_audit"]), hide_index=True, width="stretch")
     if saved["issues"]:
         with st.expander(f"⚠️ Dettagli: {len(saved['issues'])} giocatori/partite non elaborati"):
@@ -857,6 +877,13 @@ if automatic_filter:
     if excluded_rows:
         st.caption(f"Filtro automatico: escluse {len(excluded_rows)} linee con andamento delle quote incoerente "
                    f"(fino a {excluded_rows[-1]['Linea']:g}). Puoi disattivarlo per rivederle.")
+out_of_schema = [r for r in player_rows if not bet365_line_allowed(r, STATS[market_label])]
+player_rows = [r for r in player_rows if bet365_line_allowed(r, STATS[market_label])]
+if out_of_schema:
+    with st.expander(f"📋 {len(out_of_schema)} soglie alternative fuori schema Bet365"):
+        st.dataframe(pd.DataFrame(out_of_schema)[["Giocatore", "Linea", "Over", "Under", "Tipo"]],
+                     hide_index=True, width="stretch")
+        st.caption("Le soglie principali Over/Under rimangono visibili anche se diverse dalle soglie alternative.")
 min_line_enabled = st.checkbox("Imposta manualmente la prima linea disponibile", value=False)
 if min_line_enabled:
     min_line = st.number_input("Prima linea disponibile su Bet365", min_value=0.5, max_value=200.5, value=14.5, step=1.0, format="%.1f")
@@ -954,7 +981,7 @@ if st.session_state.get("stats_selection") == (player_name, season, competition_
                                 st.metric(f"Media {stat}", f"{values.mean():.1f}",
                                           f"{values.mean()-line:+.1f} rispetto alla linea")
                 st.subheader(f"Dettaglio partite — {season} · {competition_mode}")
-                detail_columns = ["GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST", "PRA"]
+                detail_columns = ["GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"]
                 if competition_mode == "Regular season + Playoff":
                     detail_columns.insert(1, "SEASON_TYPE")
                 visible = log[detail_columns].copy()
