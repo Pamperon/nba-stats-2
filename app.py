@@ -330,8 +330,8 @@ def prepare_game_log(log, team_id, season, require_dates=True):
         replacement = pd.to_datetime(log["GAME_ID"].astype(str).map(schedule), errors="coerce", utc=True)
         dates = dates.fillna(replacement)
     log["GAME_DATE"] = dates
-    if dates.isna().any() and require_dates:
-        raise ValueError(f"Date non disponibili per {int(dates.isna().sum())} partite: impossibile verificare le ultime 5/10/20.")
+    # Do not invent chronology. Missing dates do not prevent season-wide stats;
+    # last-N comparisons are hidden until the complete order is known.
     for col in ("PTS", "REB", "AST"):
         log[col] = pd.to_numeric(log[col], errors="coerce")
     if log[["PTS", "REB", "AST"]].isna().any().any():
@@ -461,9 +461,17 @@ if st.session_state.get("stats_selection") == (player_name, season):
                 previous_log = espn_game_log(nba_player["id"], previous_season)
                 if not previous_log.empty:
                     previous_log = prepare_game_log(previous_log, nba_player.get("team_id"), previous_season, require_dates=False)
-                periods = [("Ultime 5", log.head(5)), ("Ultime 10", log.head(10)),
-                           ("Ultime 20", log.head(20)), (f"Stagione {season}", log),
-                           (f"Stagione {previous_season}", previous_log)]
+                missing_dates = int(log["GAME_DATE"].isna().sum())
+                periods = []
+                if missing_dates == 0:
+                    periods.extend([("Ultime 5", log.head(5)), ("Ultime 10", log.head(10)),
+                                    ("Ultime 20", log.head(20))])
+                else:
+                    st.warning(f"ESPN non fornisce una data verificabile per {missing_dates} partite su {len(log)}. "
+                               "Le analisi ultime 5/10/20 sono sospese per evitare risultati inesatti; "
+                               "le statistiche dell'intera stagione restano disponibili.")
+                periods.extend([(f"Stagione {season}", log),
+                                (f"Stagione {previous_season}", previous_log)])
                 st.caption(f"Linea {line:g} · Over: risultato > {line:g} · Under: risultato < {line:g}")
                 for period_title, period_log in periods:
                     values = period_log[stat].dropna() if not period_log.empty else pd.Series(dtype=float)
@@ -507,7 +515,10 @@ if st.session_state.get("stats_selection") == (player_name, season):
             status = None
         error_type = type(exc).__name__
         logger.error("NBA diagnostics: stage=%s type=%s http_status=%s", diagnostic_stage, error_type, status)
-        st.error("Impossibile caricare le statistiche NBA. Le quote OddsPapi non sono coinvolte.")
+        st.error("Impossibile completare l'analisi ESPN. Le quote OddsPapi non sono coinvolte.")
+        if isinstance(exc, ValueError):
+            # Only locally constructed validation errors, never raw request URLs.
+            st.warning(f"Dettaglio verifica dati: {str(exc)[:350]}")
         with st.expander("🔎 Diagnostica connessione NBA (nessuna richiesta aggiuntiva)", expanded=True):
             st.json({"Fase": diagnostic_stage, "Tipo errore": error_type,
                      "Stato HTTP": status if status is not None else "Non disponibile",
