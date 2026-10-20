@@ -40,7 +40,7 @@ def get_json(path, **params):
         raise RuntimeError(f"Richiesta OddsPapi non riuscita (HTTP {status or 'errore di rete'}).") from None
 
 
-@st.cache_data(ttl=24 * 3600, show_spinner="Caricamento catalogo mercati…")
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner="Caricamento catalogo mercati…")
 def get_markets():
     data = get_json("markets")
     if not isinstance(data, list):
@@ -48,7 +48,7 @@ def get_markets():
     return {str(m["marketId"]): m for m in data if m.get("sportId") == 11}
 
 
-@st.cache_data(ttl=10 * 60, show_spinner="Caricamento calendario NBA…")
+@st.cache_data(ttl=24 * 3600, show_spinner="Caricamento calendario NBA…")
 def get_fixtures(date_str):
     day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     data = get_json(
@@ -64,7 +64,7 @@ def get_fixtures(date_str):
                   key=lambda f: f.get("startTime", ""))
 
 
-@st.cache_data(ttl=120, show_spinner="Caricamento quote Bet365 Italia…")
+@st.cache_data(ttl=24 * 3600, show_spinner="Caricamento quote Bet365 Italia…")
 def get_odds(fixture_id):
     return get_json("odds", fixtureId=fixture_id, bookmakers="bet365.it", verbosity=3)
 
@@ -130,10 +130,8 @@ if not API_KEY:
     st.error("Configura ODDSPAPI_API_KEY nei Secrets di Streamlit prima di proseguire.")
     st.stop()
 
-if st.button("🔄 Aggiorna dati"):
-    get_fixtures.clear()
-    get_odds.clear()
-    st.rerun()
+st.caption("Risparmio API: calendario 24 ore · catalogo mercati 7 giorni · quote 24 ore. "
+           "Cambiare giocatore o mercato non genera nuove richieste.")
 
 selected_date = st.date_input("Data delle partite (UTC)", value=datetime.now(timezone.utc).date())
 try:
@@ -150,12 +148,32 @@ options = {f"{f.get('participant1Name', '?')} – {f.get('participant2Name', '?'
            for f in fixtures}
 choice = st.selectbox("🏟️ Partita NBA", list(options))
 fixture = options[choice]
+fixture_id = str(fixture["fixtureId"])
 st.caption(f"Partite NBA trovate: {len(fixtures)}")
+
+# Nessuna richiesta alle quote finché l'utente non lo decide.
+# La selezione viene mantenuta per la sessione corrente e non passa a un'altra partita.
+if "loaded_fixture" not in st.session_state:
+    st.session_state.loaded_fixture = None
+
+col_load, col_refresh = st.columns([2, 1])
+with col_load:
+    if st.button("📥 Carica quote Bet365", type="primary"):
+        st.session_state.loaded_fixture = fixture_id
+with col_refresh:
+    if st.button("🔄 Aggiorna quote della partita"):
+        get_odds.clear()
+        st.session_state.loaded_fixture = fixture_id
+
+if st.session_state.loaded_fixture != fixture_id:
+    st.info("Seleziona una partita e premi **Carica quote Bet365**. "
+            "Cambiare partita non scarica automaticamente le quote.")
+    st.stop()
 
 market_label = st.selectbox("📊 Mercato giocatore", list(MARKETS))
 try:
     catalog = get_markets()
-    odds_data = get_odds(fixture["fixtureId"])
+    odds_data = get_odds(fixture_id)
     rows = parse_odds(odds_data, catalog, market_label)
 except (requests.RequestException, ValueError, RuntimeError) as exc:
     st.error(f"Impossibile caricare le quote: {exc}")
@@ -183,6 +201,7 @@ st.dataframe(frame[["Linea", "Over", "Under", "Principale", "Tipo"]],
              })
 st.download_button("⬇️ Scarica CSV quote", frame.to_csv(index=False).encode("utf-8-sig"),
                    file_name="nba_stats_quote.csv", mime="text/csv")
-st.caption("Aggiornamento quote: cache di 2 minuti · Calendario: 10 minuti · Catalogo: 24 ore")
+st.caption("Quote: cache 24 ore · Calendario: 24 ore · Catalogo: 7 giorni. "
+           "La cache può svuotarsi quando Streamlit riavvia l’app.")
 st.divider()
 st.caption("NBA STATS 2.0 · Prototipo quote — statistiche storiche da integrare")
