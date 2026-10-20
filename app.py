@@ -65,8 +65,46 @@ def get_fixtures(date_str):
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner="Caricamento quote Bet365 Italia…")
-def get_odds(fixture_id):
+def get_odds(fixture_id, revision=0):
     return get_json("odds", fixtureId=fixture_id, bookmakers="bet365.it", verbosity=3)
+
+
+def market_diagnostics(odds_data, catalog, market_label, player_name=None):
+    """Solo dati già scaricati: non effettua chiamate HTTP."""
+    bookmaker = (odds_data.get("bookmakerOdds") or {}).get("bet365.it") or {}
+    requested = set(MARKETS[market_label])
+    stats = {"Mercati nel feed Bet365": len(bookmaker.get("markets") or {}),
+             "Mercati del tipo richiesto": 0, "Mercati alternativi (+)": 0,
+             "Mercati alternativi attivi": 0, "Mercati alternativi inattivi": 0,
+             "Mercati senza definizione": 0, "Soglie alternative del giocatore": 0}
+    examples = []
+    for mid, market in (bookmaker.get("markets") or {}).items():
+        definition = catalog.get(str(mid))
+        if definition is None:
+            stats["Mercati senza definizione"] += 1
+            continue
+        kind = definition.get("marketType", "")
+        if kind not in requested:
+            continue
+        stats["Mercati del tipo richiesto"] += 1
+        if not kind.startswith("players-"):
+            continue
+        stats["Mercati alternativi (+)"] += 1
+        active = market.get("marketActive") is True
+        stats["Mercati alternativi attivi" if active else "Mercati alternativi inattivi"] += 1
+        for outcome_id, outcome in (market.get("outcomes") or {}).items():
+            definition_outcome = next((x for x in definition.get("outcomes", [])
+                                       if str(x.get("outcomeId")) == str(outcome_id)), {})
+            label = definition_outcome.get("outcomeName", "")
+            for player in (outcome.get("players") or {}).values():
+                if player_name and player.get("playerName") != player_name:
+                    continue
+                if player.get("active") and isinstance(player.get("price"), (int, float)):
+                    stats["Soglie alternative del giocatore"] += 1
+                    if len(examples) < 12:
+                        examples.append({"Soglia": label, "Quota": player["price"],
+                                         "Mercato attivo": active})
+    return stats, examples
 
 
 def parse_odds(odds_data, catalog, market_label):
@@ -162,7 +200,8 @@ with col_load:
         st.session_state.loaded_fixture = fixture_id
 with col_refresh:
     if st.button("🔄 Aggiorna quote della partita"):
-        get_odds.clear()
+        revisions = st.session_state.setdefault("quote_revisions", {})
+        revisions[fixture_id] = revisions.get(fixture_id, 0) + 1
         st.session_state.loaded_fixture = fixture_id
 
 if st.session_state.loaded_fixture != fixture_id:
@@ -173,7 +212,7 @@ if st.session_state.loaded_fixture != fixture_id:
 market_label = st.selectbox("📊 Mercato giocatore", list(MARKETS))
 try:
     catalog = get_markets()
-    odds_data = get_odds(fixture_id)
+    odds_data = get_odds(fixture_id, st.session_state.get("quote_revisions", {}).get(fixture_id, 0))
     rows = parse_odds(odds_data, catalog, market_label)
 except (requests.RequestException, ValueError, RuntimeError) as exc:
     st.error(f"Impossibile caricare le quote: {exc}")
@@ -201,6 +240,13 @@ st.dataframe(frame[["Linea", "Over", "Under", "Principale", "Tipo"]],
              })
 st.download_button("⬇️ Scarica CSV quote", frame.to_csv(index=False).encode("utf-8-sig"),
                    file_name="nba_stats_quote.csv", mime="text/csv")
+with st.expander("🔎 Diagnostica mercati (nessuna richiesta API aggiuntiva)"):
+    stats, examples = market_diagnostics(odds_data, catalog, market_label, player_name)
+    st.json(stats)
+    if examples:
+        st.dataframe(pd.DataFrame(examples), hide_index=True, use_container_width=True)
+    st.caption("Questi dati sono calcolati esclusivamente dalla risposta OddsPapi già caricata. "
+               "Non vengono effettuate nuove chiamate API.")
 st.caption("Quote: cache 24 ore · Calendario: 24 ore · Catalogo: 7 giorni. "
            "La cache può svuotarsi quando Streamlit riavvia l’app.")
 st.divider()
