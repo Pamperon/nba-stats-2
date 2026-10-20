@@ -85,8 +85,10 @@ def parse_odds(data, catalog, market_label):
         if is_alternative:
             diag["Mercati alternativi (+)"] += 1
             diag["Mercati alternativi attivi" if active_market else "Mercati alternativi inattivi"] += 1
-        elif not active_market:
-            continue  # Keep strict filtering for main O/U markets.
+        if not active_market:
+            diag.setdefault("Mercati inattivi esclusi", 0)
+            diag["Mercati inattivi esclusi"] += 1
+            continue  # Apply active-market requirement to BOTH main and alternative markets.
         names = {str(o.get("outcomeId")): str(o.get("outcomeName", "")) for o in definition.get("outcomes", [])}
         for outcome_id, outcome in (market_data.get("outcomes") or {}).items():
             name = names.get(str(outcome_id), "")
@@ -469,15 +471,24 @@ if not rows:
 player_name = st.selectbox("🏀 Giocatore", sorted({r["Giocatore"] for r in rows}))
 player_rows = [r for r in rows if r["Giocatore"] == player_name]
 st.subheader(f"{player_name} · {market_label}")
-st.caption("'Soglia +' indica solo Over (20+ = Over 19,5). Nessuna quota Under viene inventata.")
+st.caption("Le soglie '+' mostrano soltanto la quota Over (20+ = Over 19,5). Nessuna quota Under viene inventata.")
+st.caption("Le quote provengono dal feed OddsPapi: un mercato indicato come attivo dall'API potrebbe non essere visibile su Bet365. Puoi escludere manualmente le linee non presenti.")
+min_line_enabled = st.checkbox("Escludi linee inferiori a una soglia verificata su Bet365", value=False)
+min_line = None
+if min_line_enabled:
+    min_line = st.number_input("Prima linea disponibile su Bet365", min_value=0.5, max_value=200.5, value=14.5, step=1.0, format="%.1f")
+    player_rows = [r for r in player_rows if r["Linea"] >= min_line]
+if not player_rows:
+    st.warning("Nessuna linea rimasta dopo il filtro. Disattivalo o abbassa la soglia.")
+    st.stop()
 frame = pd.DataFrame(player_rows).sort_values("Linea")
 frame["Principale"] = frame["Principale"].map({True: "Sì", False: ""})
-st.dataframe(frame[["Linea", "Over", "Under", "Principale", "Tipo", "Stato API"]],
+st.dataframe(frame[["Linea", "Over", "Under", "Principale"]],
     hide_index=True, width="stretch",
     column_config={"Linea": st.column_config.NumberColumn(format="%.1f"),
                    "Over": st.column_config.NumberColumn(format="%.3f"),
                    "Under": st.column_config.NumberColumn(format="%.3f")})
-st.download_button("⬇️ Scarica CSV quote", frame.to_csv(index=False).encode("utf-8-sig"),
+st.download_button("⬇️ Scarica CSV quote", frame[["Giocatore", "Linea", "Over", "Under", "Principale"]].to_csv(index=False).encode("utf-8-sig"),
                    file_name="nba_stats_quote.csv", mime="text/csv")
 with st.expander("🔎 Diagnostica mercati (nessuna richiesta OddsPapi aggiuntiva)"):
     st.json(diag)
