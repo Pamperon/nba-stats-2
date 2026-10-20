@@ -1,11 +1,13 @@
 """NBA STATS 2.0: OddsPapi Bet365 + official NBA player game logs."""
 from datetime import datetime, timedelta, timezone
 import re
+import logging
 import pandas as pd
 import requests
 import streamlit as st
 
 st.set_page_config(page_title="NBA STATS 2.0", page_icon="🏀", layout="wide")
+logger = logging.getLogger("nba_stats_diagnostics")
 BASE = "https://api.oddspapi.io/v4"
 MARKETS = {
     "Punti (PTS)": ("playertotals-points", "players-points"),
@@ -199,7 +201,7 @@ st.caption("'Soglia +' indica solo Over (20+ = Over 19,5). Nessuna quota Under v
 frame = pd.DataFrame(player_rows).sort_values("Linea")
 frame["Principale"] = frame["Principale"].map({True: "Sì", False: ""})
 st.dataframe(frame[["Linea", "Over", "Under", "Principale", "Tipo", "Stato API"]],
-    hide_index=True, use_container_width=True,
+    hide_index=True, width="stretch",
     column_config={"Linea": st.column_config.NumberColumn(format="%.1f"),
                    "Over": st.column_config.NumberColumn(format="%.3f"),
                    "Under": st.column_config.NumberColumn(format="%.3f")})
@@ -216,12 +218,17 @@ season = st.selectbox("Stagione NBA", ["2026-27", "2025-26", "2024-25"])
 if st.button("📊 Carica statistiche NBA del giocatore"):
     st.session_state.stats_selection = (player_name, season)
 if st.session_state.get("stats_selection") == (player_name, season):
+    diagnostic_stage = "Caricamento anagrafica giocatori NBA"
     try:
-        nba_player = match_nba_player(player_name, nba_player_directory())
+        directory = nba_player_directory()
+        diagnostic_stage = "Abbinamento del nome del giocatore"
+        nba_player = match_nba_player(player_name, directory)
         if not nba_player:
             st.warning("Nome giocatore non abbinato automaticamente all'anagrafica NBA. Non sono stati utilizzati dati di un altro giocatore.")
         else:
+            diagnostic_stage = "Recupero storico partite da stats.nba.com"
             log = nba_game_log(nba_player["id"], season)
+            diagnostic_stage = "Elaborazione e visualizzazione statistiche"
             if log.empty:
                 st.info("Nessuna partita di regular season disponibile per questo giocatore e questa stagione.")
             else:
@@ -242,9 +249,20 @@ if st.session_state.get("stats_selection") == (player_name, season):
                 st.write(f"Media {stat} stagionale: **{log[stat].mean():.1f}**")
                 visible = log[["GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST", "PRA"]].copy()
                 visible["GAME_DATE"] = visible["GAME_DATE"].dt.strftime("%d/%m/%Y")
-                st.dataframe(visible, hide_index=True, use_container_width=True)
-    except Exception:
-        # NBA endpoints often time out or block cloud hosts. Avoid leaking URLs or internals.
-        st.error("Non è stato possibile recuperare le statistiche da stats.nba.com. Il servizio NBA potrebbe non rispondere ai server Streamlit Cloud. Le quote OddsPapi non sono coinvolte.")
+                st.dataframe(visible, hide_index=True, width="stretch")
+    except Exception as exc:
+        # Never display or log raw exception text: request exceptions can contain URLs.
+        # Only publish the stage, exception class, and numeric HTTP status if present.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if not isinstance(status, int):
+            status = None
+        error_type = type(exc).__name__
+        logger.error("NBA diagnostics: stage=%s type=%s http_status=%s", diagnostic_stage, error_type, status)
+        st.error("Impossibile caricare le statistiche NBA. Le quote OddsPapi non sono coinvolte.")
+        with st.expander("🔎 Diagnostica connessione NBA (nessuna richiesta aggiuntiva)", expanded=True):
+            st.json({"Fase": diagnostic_stage, "Tipo errore": error_type,
+                     "Stato HTTP": status if status is not None else "Non disponibile",
+                     "Giocatore": player_name, "Stagione": season})
+            st.caption("Questi dettagli sono ricavati dall'errore già avvenuto: non viene eseguito alcun nuovo test di rete. Non condividere eventuali credenziali presenti in altri log.")
 
 st.caption("Quote: cache 24 ore · Calendario: 24 ore · Catalogo: 7 giorni · Statistiche NBA: cache 6 ore. La cache può svuotarsi ai riavvii.")
