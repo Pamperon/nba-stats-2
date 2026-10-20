@@ -1,5 +1,6 @@
 """NBA STATS 2.0: OddsPapi Bet365 + free ESPN player game logs."""
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import re
 import logging
 import traceback
@@ -10,6 +11,7 @@ import streamlit as st
 st.set_page_config(page_title="NBA STATS 2.0", page_icon="🏀", layout="wide")
 logger = logging.getLogger("nba_stats_diagnostics")
 BASE = "https://api.oddspapi.io/v4"
+ROME_TZ = ZoneInfo("Europe/Rome")
 MARKETS = {
     "Punti (PTS)": ("playertotals-points", "players-points"),
     "Rimbalzi (REB)": ("playertotals-rebounds", "players-rebounds"),
@@ -62,18 +64,53 @@ def get_markets():
     return {str(m["marketId"]): m for m in data if str(m.get("sportId")) == "11"}
 
 
+def fixture_start_rome(fixture):
+    """Convert an OddsPapi ISO timestamp to Italian local time."""
+    raw = fixture.get("startTime")
+    if not raw:
+        return None
+    try:
+        if isinstance(raw, (int, float)):
+            timestamp = float(raw)
+            if timestamp > 1e11:  # Unix milliseconds
+                timestamp /= 1000
+            instant = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        else:
+            value = str(raw).strip()
+            if value.endswith("Z"):
+                value = value[:-1] + "+00:00"
+            instant = datetime.fromisoformat(value)
+            # OddsPapi UTC timestamps may omit their explicit Z suffix.
+            if instant.tzinfo is None:
+                instant = instant.replace(tzinfo=timezone.utc)
+        return instant.astimezone(ROME_TZ)
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
 @st.cache_data(ttl=86400, show_spinner="Calendario NBA…")
 def get_fixtures(day_string):
-    start = datetime.strptime(day_string, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    # Calendar day is Europe/Rome, including daylight-saving transitions.
+    local_start = datetime.strptime(day_string, "%Y-%m-%d").replace(tzinfo=ROME_TZ)
+    local_end = (local_start + timedelta(days=1))
+    utc_start = local_start.astimezone(timezone.utc)
+    utc_end = local_end.astimezone(timezone.utc)
     data = get_json("fixtures", sportId=11, **{
-        "from": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "to": (start + timedelta(days=1) - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "from": utc_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "to": (utc_end - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     })
     if isinstance(data, dict):
         data = data.get("fixtures", data.get("data", []))
     if not isinstance(data, list):
         raise ValueError("Formato calendario inatteso")
-    return sorted((f for f in data if str(f.get("tournamentName", "")).casefold() == "nba"), key=lambda f: str(f.get("startTime", "")))
+    matches = []
+    for fixture in data:
+        if str(fixture.get("tournamentName", "")).casefold() != "nba":
+            continue
+        start_rome = fixture_start_rome(fixture)
+        if start_rome is not None and start_rome.date().isoformat() == day_string:
+            matches.append(fixture)
+    return sorted(matches, key=lambda f: fixture_start_rome(f))
 
 
 @st.cache_data(ttl=86400, show_spinner="Quote Bet365…")
@@ -822,7 +859,7 @@ if not API_KEY:
     st.error("Configura ODDSPAPI_API_KEY nei Secrets di Streamlit.")
     st.stop()
 
-selected_date = st.date_input("Data delle partite (UTC)", value=datetime.now(timezone.utc).date())
+selected_date = st.date_input("Data delle partite (ora italiana)", value=datetime.now(ROME_TZ).date())
 try:
     fixtures = get_fixtures(selected_date.isoformat())
 except (RuntimeError, ValueError) as exc:
@@ -831,10 +868,10 @@ except (RuntimeError, ValueError) as exc:
 if not fixtures:
     st.warning("Nessuna partita NBA trovata per questa data.")
     st.stop()
-options = {f"{f.get('participant1Name', '?')} – {f.get('participant2Name', '?')} | {str(f.get('startTime', ''))[:16].replace('T', ' ')} UTC": f for f in fixtures}
+options = {f"{f.get('participant1Name', '?')} – {f.get('participant2Name', '?')} | {fixture_start_rome(f).strftime('%d/%m/%Y %H:%M')} (Italia)": f for f in fixtures}
 choice = st.selectbox("🏟️ Partita NBA", list(options))
 fixture_id = str(options[choice]["fixtureId"])
-st.caption(f"Partite NBA trovate: {len(fixtures)}")
+st.caption(f"Partite NBA trovate: {len(fixtures)} · Date e orari in Europe/Rome (ora italiana)")
 section = st.radio("Sezione", ["📊 Analisi singola partita", "🔎 NBA Value Finder"], horizontal=True)
 if section == "🔎 NBA Value Finder":
     if "odds_refresh_versions" not in st.session_state:
