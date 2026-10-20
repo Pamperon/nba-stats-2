@@ -752,13 +752,12 @@ def render_value_finder(fixtures, selected_date):
     with c1:
         min_games = st.number_input("Partite minime", min_value=10, max_value=60, value=20, step=5)
     with c2:
-        odds_min = st.number_input("Quota minima", min_value=1.01, max_value=10.0, value=1.50, step=0.05)
+        odds_min = st.number_input("Quota minima", min_value=1.01, max_value=10.0, value=1.15, step=0.05)
     with c3:
-        odds_max = st.number_input("Quota massima", min_value=1.01, max_value=20.0, value=3.00, step=0.10)
-    min_value = st.slider("Value stimato minimo (%)", min_value=0, max_value=50, value=5, step=1)
-    st.caption("Nessuna soglia minima arbitraria: anche le linee 0,5 vengono esaminate. "
-               "La disponibilità reale su Bet365 non è certificata dal feed.")
-    st.caption("Il value è una stima euristica: usa frequenze stagionali corrette verso il 50% e andamento recente. Non include infortuni, avversario, quintetti o casa/trasferta.")
+        odds_max = st.number_input("Quota massima", min_value=1.01, max_value=20.0, value=2.00, step=0.10)
+    min_value = st.slider("Value stimato minimo (%)", min_value=-100, max_value=50, value=-100, step=1, help="-100% mostra anche le selezioni con Value negativo; 0% mostra solo quelle con Value non negativo.")
+    st.caption("Le linee 0,5 sono escluse come richiesto. Con Value minimo -100% vengono mostrate anche le selezioni a Value negativo, purché superino gli altri controlli. La disponibilità reale su Bet365 non è certificata dal feed.")
+    st.caption("Il Value è una stima euristica: usa frequenze stagionali corrette verso il 50% e andamento recente. Un Value negativo indica un rendimento teorico sfavorevole secondo il modello, non una quota da giocare. Non include infortuni, avversario, quintetti o casa/trasferta.")
     if odds_min > odds_max:
         st.warning("La quota minima deve essere inferiore o uguale alla quota massima.")
         return
@@ -788,12 +787,12 @@ def render_value_finder(fixtures, selected_date):
                f"Segnalazioni: {len(saved['issues'])}")
     if saved["results"]:
         df = pd.DataFrame(saved["results"])
-        st.write(f"**{len(df)} opportunità individuate** (ordinate per value stimato)")
+        st.write(f"**{len(df)} selezioni analizzate** (ordinate per Value stimato; clicca sulle intestazioni per cambiare ordine)")
         st.dataframe(df, hide_index=True, width="stretch")
         st.download_button("⬇️ Scarica risultati CSV", df.to_csv(index=False).encode("utf-8-sig"),
                            file_name="nba_value_finder.csv", mime="text/csv")
     else:
-        st.warning("Nessuna opportunità supera i filtri, oppure i dati ESPN disponibili sono insufficienti.")
+        st.warning("Nessuna selezione supera i filtri, oppure i dati ESPN disponibili sono insufficienti.")
     with st.expander("🔬 Diagnostica originale OddsPapi — linee e stati del feed"):
         st.warning("'Attivo nel feed' NON significa 'disponibile su Bet365'. "
                    "Questa diagnostica mostra esattamente quali esiti e identificativi sono stati ricevuti, "
