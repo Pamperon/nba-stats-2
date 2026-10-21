@@ -791,8 +791,15 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
     return results, issues, quote_count, len(props_by_player), raw_audit, filter_audit
 
 
+FINDER_MODEL_VERSION = "2.1-empirica-jeffreys-20261021"
+
 def render_value_finder(fixtures, selected_date):
     st.subheader("🔎 NBA Value Finder — tutte le linee Over alternative")
+    st.caption(f"Versione modello: **{FINDER_MODEL_VERSION}**")
+    old = st.session_state.get("finder_results")
+    if old and old.get("model_version") != FINDER_MODEL_VERSION:
+        st.session_state.pop("finder_results", None)
+        st.warning("Le analisi della versione precedente sono state invalidate. Premi Analizza per ricalcolare con la nuova formula; le quote già caricate in sessione vengono riutilizzate.")
     st.info("Il CSV completo include tutte le quote Over alternative attive ricevute dal feed, anche se non rispettano i filtri o non hanno statistiche ESPN sufficienti. Le probabilità sono **stime euristiche non calibrate**, non garanzie.")
     st.caption("La scansione riutilizza le quote delle partite già caricate in sessione. Per le altre può richiedere una chiamata OddsPapi per partita; non aggiorna automaticamente le quote.")
     season = st.selectbox("Stagione da analizzare", ["2026-27", "2025-26", "2024-25"], index=0, key="finder_season")
@@ -816,7 +823,7 @@ def render_value_finder(fixtures, selected_date):
                 fixtures, catalog, season, int(min_games), float(odds_min), float(odds_max),
                 int(min_value), lambda p, t: progress.progress(min(1.0, max(0.0, p)), text=t))
             st.session_state.finder_results = {
-                "date": str(selected_date), "season": season,
+                "date": str(selected_date), "season": season, "model_version": FINDER_MODEL_VERSION,
                 "results": results, "issues": issues, "odds_count": odds_count,
                 "player_count": player_count, "raw_audit": raw_audit,
                 "filter_audit": filter_audit}
@@ -828,14 +835,14 @@ def render_value_finder(fixtures, selected_date):
     if not saved or saved["date"] != str(selected_date) or saved["season"] != season:
         return
     rows = saved["results"]
-    st.caption(f"Linee nel CSV: {len(rows)} · Giocatori: {saved['player_count']} · Segnalazioni: {len(saved['issues'])}")
+    st.caption(f"Modello {FINDER_MODEL_VERSION} · Linee nel CSV: {len(rows)} · Giocatori: {saved['player_count']} · Segnalazioni: {len(saved['issues'])}")
     if not rows:
         st.warning("Nessuna quota alternativa attiva restituita per le partite selezionate.")
         return
     df = pd.DataFrame(rows)
     st.download_button("⬇️ Scarica CSV COMPLETO — tutte le linee",
                        df.to_csv(index=False).encode("utf-8-sig"),
-                       file_name="nba_value_finder_tutte_le_linee.csv", mime="text/csv")
+                       file_name="nba_value_finder_tutte_le_linee_modello_2_1.csv", mime="text/csv")
     valid = df[df["Stato analisi"] == "Valutabile (stima empirica)"].copy()
     valid = valid[(valid["Quota"] >= odds_min) & (valid["Quota"] <= odds_max) &
                   (valid["Value stimato %"] >= min_value)]
