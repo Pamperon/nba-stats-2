@@ -666,24 +666,47 @@ def odds_source_audit(odds, catalog, match_name):
     return result
 
 
+def finder_detailed_stats(log, stat, line):
+    """Descrittori osservati, non un modello probabilistico validato."""
+    frame = log.copy()
+    frame[stat] = pd.to_numeric(frame[stat], errors="coerce")
+    frame["GAME_DATE"] = pd.to_datetime(frame["GAME_DATE"], errors="coerce", utc=True)
+    frame = frame.dropna(subset=[stat, "GAME_DATE"]).sort_values("GAME_DATE", ascending=False)
+    if frame.empty:
+        return {}
+    vals = frame[stat]
+    def hits(n):
+        sub = vals.head(n)
+        return f"{int((sub > line).sum())}/{len(sub)}"
+    minutes = pd.to_numeric(frame["MIN"], errors="coerce") if "MIN" in frame else pd.Series(dtype=float)
+    return {"Ultime 5": hits(5), "Ultime 10": hits(10), "Ultime 20": hits(20),
+            "Stagione %": round(100 * float((vals > line).mean()), 1),
+            "Partite": len(vals), "Media": round(float(vals.mean()), 1),
+            "Scarto medio": round(float(vals.mean() - line), 1),
+            "Dev. standard": round(float(vals.std(ddof=1)), 1) if len(vals) > 1 else None,
+            "Minuti medi": round(float(minutes.mean()), 1) if minutes.notna().any() else None,
+            "Minuti ultime 5": round(float(minutes.head(5).mean()), 1) if minutes.head(5).notna().any() else None}
+
+
 def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
                 min_value, progress_callback=None):
-    """One cached OddsPapi odds request per fixture, three markets per response.
+    """Esporta tutte le linee alternative attive ricevute, incluse non valutabili.
 
-    ESPN classification is cached per athlete/season and reused for all markets.
+    Un'unica risposta OddsPapi per partita; se già presente in sessione la riusa.
+    I filtri sono soltanto per la vista, mai per il CSV completo.
     """
-    results, issues = [], []
-    players_index = finder_player_index(int(season[:4]) + 1)
-    odds_rows = []
-    raw_audit = []
-    filter_audit = []
+    results, issues, raw_audit, filter_audit = [], [], [], []
+    index = finder_player_index(int(season[:4]) + 1)
+    props_by_player = {}
+    quote_count = 0
     for idx, fixture in enumerate(fixtures):
         fid = str(fixture["fixtureId"])
         match_name = f"{fixture.get('participant1Name', '?')} - {fixture.get('participant2Name', '?')}"
         if progress_callback:
-            progress_callback(idx / max(len(fixtures), 1) * 0.25, f"Quote: {match_name}")
+            progress_callback(0.25 * idx / max(len(fixtures), 1), f"Quote: {match_name}")
         try:
-            odds = get_odds(fid, st.session_state.odds_refresh_versions.get(fid, 0))
+            stored = st.session_state.get("odds_by_fixture", {}).get(fid)
+            odds = stored if stored is not None else get_odds(fid, st.session_state.get("odds_refresh_versions", {}).get(fid, 0))
             raw_audit.extend(odds_source_audit(odds, catalog, match_name))
             for market_label in MARKETS:
                 parsed, _ = parse_odds(odds, catalog, market_label)
@@ -691,102 +714,95 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
                 for row in parsed:
                     grouped.setdefault(row["Giocatore"], []).append(row)
                 for player_name, group in grouped.items():
-                    removed_half = [r for r in group if abs(float(r["Linea"]) - 0.5) < 1e-6]
-                    for row in removed_half:
-                        filter_audit.append({"Partita": match_name, "Giocatore": player_name,
-                                             "Mercato": STATS[market_label], "Linea": row["Linea"],
-                                             "Motivo": "Linea 0,5 esclusa per scelta: non disponibile su Bet365"})
-                    eligible = []
-                    for r in group:
-                        if abs(float(r["Linea"]) - 0.5) < 1e-6:
-                            continue
-                        if not bet365_line_allowed(r, STATS[market_label]):
-                            filter_audit.append({"Partita": match_name, "Giocatore": player_name,
-                                                 "Mercato": STATS[market_label], "Linea": r["Linea"],
-                                                 "Motivo": "Soglia alternativa fuori schema Bet365 verificato"})
-                            continue
-                        eligible.append(r)
-                    filtered, excluded = auto_filter_suspicious_lines(eligible)
-                    for row in excluded:
-                        filter_audit.append({"Partita": match_name, "Giocatore": player_name,
-                                             "Mercato": STATS[market_label], "Linea": row["Linea"],
-                                             "Motivo": "Quota Over della linea inferiore maggiore della linea successiva"})
-                    for row in filtered:
+                    # Il controllo di coerenza non deve cancellare righe dall'esportazione.
+                    eligible = [r for r in group if bet365_line_allowed(r, STATS[market_label])]
+                    _, excluded = auto_filter_suspicious_lines(eligible)
+                    bad_keys = {(r["Giocatore"], float(r["Linea"])) for r in excluded}
+                    for row in group:
+                        line = float(row["Linea"])
                         if not bet365_line_allowed(row, STATS[market_label]):
+                            reason = "Soglia fuori schema configurato" if line != 0.5 else "Linea 0,5 esclusa dalla classifica"
+                        elif (player_name, line) in bad_keys:
+                            reason = "Quote incoerenti tra soglie: verificare su Bet365"
+                        else:
+                            reason = ""
+                        if reason:
                             filter_audit.append({"Partita": match_name, "Giocatore": player_name,
-                                                 "Mercato": STATS[market_label], "Linea": row["Linea"],
-                                                 "Motivo": "Soglia alternativa fuori schema Bet365 verificato"})
-                            continue
-                        for side in ("Over",):
-                            price = row.get(side)
-                            if isinstance(price, (int, float)) and odds_min <= price <= odds_max:
-                                odds_rows.append((match_name, player_name, market_label, row["Linea"], side, float(price)))
+                                                 "Mercato": STATS[market_label], "Linea": line,
+                                                 "Motivo": reason})
+                        price = float(row["Over"])
+                        quote_count += 1
+                        props_by_player.setdefault(player_name, []).append((match_name, market_label, line, price, reason))
         except Exception as exc:
             issues.append(f"Quote non disponibili per {match_name}: {type(exc).__name__}")
-    # Process each athlete only once, regardless of number of props and lines.
-    grouped_props = {}
-    for match_name, player_name, market_label, line, side, price in odds_rows:
-        grouped_props.setdefault(player_name, []).append((match_name, market_label, line, side, price))
-    total = len(grouped_props)
-    for idx, (player_name, props) in enumerate(grouped_props.items()):
+    for idx, (player_name, props) in enumerate(props_by_player.items()):
         if progress_callback:
-            progress_callback(0.25 + 0.75 * idx / max(total, 1),
-                              f"ESPN: {idx + 1}/{total} giocatori — {player_name}")
-        athlete = players_index.get(normalized_name(player_name))
-        if athlete is None:
-            issues.append(f"Giocatore non identificato: {player_name}")
-            continue
-        try:
-            games = selected_game_log(athlete["id"], season, "Regular season", athlete["team_id"])
-            if games.empty:
-                continue
-            games = prepare_game_log(games, athlete["team_id"], season, require_dates=False)
-        except Exception as exc:
-            issues.append(f"Statistiche non disponibili: {player_name} ({type(exc).__name__})")
-            continue
-        if games["GAME_DATE"].isna().any() or len(games) < min_games:
-            continue
-        for match_name, market_label, line, side, price in props:
+            progress_callback(0.25 + 0.75 * idx / max(len(props_by_player), 1),
+                              f"ESPN: {idx + 1}/{len(props_by_player)} — {player_name}")
+        athlete = index.get(normalized_name(player_name))
+        games = None
+        error = "Giocatore non identificato su ESPN" if athlete is None else ""
+        if athlete is not None:
+            try:
+                games = selected_game_log(athlete["id"], season, "Regular season", athlete["team_id"])
+                if games.empty:
+                    error = "Nessuna partita ESPN nella stagione selezionata"
+                else:
+                    games = prepare_game_log(games, athlete["team_id"], season, require_dates=False)
+                    if games["GAME_DATE"].isna().any():
+                        error = "Date ESPN incomplete"
+                        games = None
+            except Exception as exc:
+                error = f"Dati ESPN non disponibili ({type(exc).__name__})"
+                games = None
+        if error:
+            issues.append(f"{player_name}: {error}")
+        for match_name, market_label, line, price, reason in props:
             stat = STATS[market_label]
-            estimate = finder_estimate_probability(games, stat, float(line), side)
-            if not estimate or estimate["n"] < min_games:
-                continue
-            ev = estimate["estimate"] * price - 1.0
-            if ev < min_value / 100.0:
-                continue
-            results.append({
-                "Partita": match_name, "Giocatore": player_name,
-                "Mercato": stat, "Scelta": side, "Linea": float(line),
-                "Quota": price, "Prob. stimata %": round(100 * estimate["estimate"], 1),
-                "Prob. implicita %": round(100 / price, 1),
-                "Value stimato %": round(100 * ev, 1),
-                "Ultime 20": f"{estimate['recent_hits']}/{estimate['n_recent']}",
-                "Stagione %": round(100 * estimate["season"], 1),
-                "Partite": estimate["n"], "Media": round(estimate["avg"], 1),
-            })
+            row = {"Partita": match_name, "Giocatore": player_name, "Mercato": stat,
+                   "Scelta": "Over", "Linea": line, "Quota": price,
+                   "Prob. stimata %": None, "Prob. implicita %": round(100 / price, 1),
+                   "Value stimato %": None, "Ultime 5": "—", "Ultime 10": "—",
+                   "Ultime 20": "—", "Stagione %": None, "Partite": 0,
+                   "Media": None, "Scarto medio": None, "Dev. standard": None,
+                   "Minuti medi": None, "Minuti ultime 5": None,
+                   "Stato analisi": "Non valutabile", "Nota": reason or error}
+            if games is not None and not games.empty:
+                details = finder_detailed_stats(games, stat, line)
+                row.update(details)
+                if len(games) < min_games:
+                    row["Nota"] = "; ".join(filter(None, [reason, f"Solo {len(games)} partite ESPN (minimo {min_games})"]))
+                elif not reason:
+                    estimate = finder_estimate_probability(games, stat, line, "Over")
+                    if estimate:
+                        prob = estimate["estimate"]
+                        row["Prob. stimata %"] = round(prob * 100, 1)
+                        row["Value stimato %"] = round((prob * price - 1) * 100, 1)
+                        row["Stato analisi"] = "Valutabile (stima euristica)"
+                        row["Nota"] = "Stima NON calibrata; verifica quota e disponibilità"
+            results.append(row)
     if progress_callback:
         progress_callback(1.0, "Analisi completata")
-    results.sort(key=lambda x: (x["Value stimato %"], x["Partite"]), reverse=True)
-    return results, issues, len(odds_rows), total, raw_audit, filter_audit
+    results.sort(key=lambda r: (r["Prob. stimata %"] is not None,
+                                r["Prob. stimata %"] if r["Prob. stimata %"] is not None else -1), reverse=True)
+    return results, issues, quote_count, len(props_by_player), raw_audit, filter_audit
 
 
 def render_value_finder(fixtures, selected_date):
-    st.subheader("🔎 NBA Value Finder — opportunità della giornata")
-    st.info("Classifica sperimentale basata sui risultati passati: non è una previsione affidabile né una garanzia di valore reale. Le quote potrebbero essere cambiate.")
-    st.caption("La scansione usa le quote OddsPapi delle partite selezionate e le statistiche ESPN di regular season. Una richiesta quote per partita non già in cache; nessun aggiornamento automatico.")
-    season = st.selectbox("Stagione da analizzare", ["2026-27", "2025-26", "2024-25"], index=1, key="finder_season")
+    st.subheader("🔎 NBA Value Finder — tutte le linee Over alternative")
+    st.info("Il CSV completo include tutte le quote Over alternative attive ricevute dal feed, anche se non rispettano i filtri o non hanno statistiche ESPN sufficienti. Le probabilità sono **stime euristiche non calibrate**, non garanzie.")
+    st.caption("La scansione riutilizza le quote delle partite già caricate in sessione. Per le altre può richiedere una chiamata OddsPapi per partita; non aggiorna automaticamente le quote.")
+    season = st.selectbox("Stagione da analizzare", ["2026-27", "2025-26", "2024-25"], index=0, key="finder_season")
     c1, c2, c3 = st.columns(3)
     with c1:
-        min_games = st.number_input("Partite minime", min_value=10, max_value=60, value=20, step=5)
+        min_games = st.number_input("Partite minime per la stima", min_value=10, max_value=60, value=15, step=5)
     with c2:
-        odds_min = st.number_input("Quota minima", min_value=1.01, max_value=10.0, value=1.15, step=0.05)
+        odds_min = st.number_input("Quota minima (solo classifica)", min_value=1.01, max_value=10.0, value=1.15, step=0.05)
     with c3:
-        odds_max = st.number_input("Quota massima", min_value=1.01, max_value=20.0, value=2.00, step=0.10)
-    min_value = st.slider("Value stimato minimo (%)", min_value=-100, max_value=50, value=-100, step=1, help="-100% mostra anche le selezioni con Value negativo; 0% mostra solo quelle con Value non negativo.")
-    st.caption("Le linee 0,5 sono escluse come richiesto. Con Value minimo -100% vengono mostrate anche le selezioni a Value negativo, purché superino gli altri controlli. La disponibilità reale su Bet365 non è certificata dal feed.")
-    st.caption("Il Value è una stima euristica: usa frequenze stagionali corrette verso il 50% e andamento recente. Un Value negativo indica un rendimento teorico sfavorevole secondo il modello, non una quota da giocare. Non include infortuni, avversario, quintetti o casa/trasferta.")
+        odds_max = st.number_input("Quota massima (solo classifica)", min_value=1.01, max_value=20.0, value=2.00, step=0.10)
+    min_value = st.slider("Value minimo (solo classifica)", -100, 50, -100, 1)
     if odds_min > odds_max:
-        st.warning("La quota minima deve essere inferiore o uguale alla quota massima.")
+        st.warning("La quota minima deve essere inferiore o uguale alla massima.")
         return
     if st.button(f"🔍 Analizza tutte le {len(fixtures)} partite", type="primary", key="finder_start"):
         st.session_state.pop("finder_results", None)
@@ -798,48 +814,46 @@ def render_value_finder(fixtures, selected_date):
                 int(min_value), lambda p, t: progress.progress(min(1.0, max(0.0, p)), text=t))
             st.session_state.finder_results = {
                 "date": str(selected_date), "season": season,
-                "results": results, "issues": issues,
-                "odds_count": odds_count, "player_count": player_count,
-                "raw_audit": raw_audit, "filter_audit": filter_audit,
-            }
+                "results": results, "issues": issues, "odds_count": odds_count,
+                "player_count": player_count, "raw_audit": raw_audit,
+                "filter_audit": filter_audit}
         except Exception as exc:
-            st.error(f"Scansione interrotta ({type(exc).__name__}). Le quote già in cache restano disponibili.")
+            st.error(f"Scansione interrotta ({type(exc).__name__}). Quote già in sessione preservate.")
         finally:
             progress.empty()
     saved = st.session_state.get("finder_results")
     if not saved or saved["date"] != str(selected_date) or saved["season"] != season:
         return
-    st.caption(f"Quote candidate: {saved['odds_count']} · Giocatori esaminati: {saved['player_count']} · "
-               f"Linee escluse dai controlli: {len(saved.get('filter_audit', []))} · "
-               f"Segnalazioni: {len(saved['issues'])}")
-    if saved["results"]:
-        df = pd.DataFrame(saved["results"])
-        st.write(f"**{len(df)} selezioni analizzate** (ordinate per Value stimato; clicca sulle intestazioni per cambiare ordine)")
-        st.dataframe(df, hide_index=True, width="stretch")
-        st.download_button("⬇️ Scarica risultati CSV", df.to_csv(index=False).encode("utf-8-sig"),
-                           file_name="nba_value_finder.csv", mime="text/csv")
-    else:
-        st.warning("Nessuna selezione supera i filtri, oppure i dati ESPN disponibili sono insufficienti.")
-    with st.expander("🔬 Diagnostica originale OddsPapi — linee e stati del feed"):
-        st.warning("'Attivo nel feed' NON significa 'disponibile su Bet365'. "
-                   "Questa diagnostica mostra esattamente quali esiti e identificativi sono stati ricevuti, "
-                   "senza effettuare nuove richieste OddsPapi.")
-        audit_df = pd.DataFrame(saved.get("raw_audit", []))
-        if not audit_df.empty:
-            suspicious = audit_df.loc[audit_df["Linea interpretata"] <= 0.5]
-            st.write(f"**Esiti con linea 0,5 nel feed:** {len(suspicious)}")
-            st.dataframe(suspicious, hide_index=True, width="stretch")
-            st.download_button("⬇️ Scarica diagnostica completa CSV",
-                               audit_df.to_csv(index=False).encode("utf-8-sig"),
+    rows = saved["results"]
+    st.caption(f"Linee nel CSV: {len(rows)} · Giocatori: {saved['player_count']} · Segnalazioni: {len(saved['issues'])}")
+    if not rows:
+        st.warning("Nessuna quota alternativa attiva restituita per le partite selezionate.")
+        return
+    df = pd.DataFrame(rows)
+    st.download_button("⬇️ Scarica CSV COMPLETO — tutte le linee",
+                       df.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="nba_value_finder_tutte_le_linee.csv", mime="text/csv")
+    valid = df[df["Stato analisi"] == "Valutabile (stima euristica)"].copy()
+    valid = valid[(valid["Quota"] >= odds_min) & (valid["Quota"] <= odds_max) &
+                  (valid["Value stimato %"] >= min_value)]
+    mode = st.radio("Ordina la classifica", ["Probabilità stimata", "Value stimato"], horizontal=True)
+    key = "Prob. stimata %" if mode == "Probabilità stimata" else "Value stimato %"
+    valid = valid.sort_values([key, "Partite"], ascending=False)
+    st.write(f"**Top 10 — {mode.lower()}** (filtri applicati solo alla classifica)")
+    st.dataframe(valid.head(10), hide_index=True, width="stretch")
+    st.write(f"**Tutte le {len(df)} linee ricevute**, incluse quelle non valutabili")
+    st.dataframe(df, hide_index=True, width="stretch")
+    st.caption("Ultime 5/10/20 e stagione sono frequenze osservate. La probabilità è l'euristica precedente: 75% frequenza stagionale smussata verso 50%, 25% ultime 20. Minuti e variabilità sono mostrati ma NON modificano ancora la stima: serve validazione su più partite.")
+    with st.expander("🔬 Diagnostica OddsPapi e linee segnalate"):
+        audit = pd.DataFrame(saved.get("raw_audit", []))
+        if not audit.empty:
+            st.download_button("⬇️ Scarica feed diagnostico", audit.to_csv(index=False).encode("utf-8-sig"),
                                file_name="odds_feed_diagnostica.csv", mime="text/csv")
-        else:
-            st.info("Nessun esito disponibile per la diagnostica.")
         if saved.get("filter_audit"):
-            st.write("**Linee escluse dai controlli (coerenza e schema):**")
             st.dataframe(pd.DataFrame(saved["filter_audit"]), hide_index=True, width="stretch")
     if saved["issues"]:
-        with st.expander(f"⚠️ Dettagli: {len(saved['issues'])} giocatori/partite non elaborati"):
-            st.write("\n".join(f"- {issue}" for issue in saved["issues"][:100]))
+        with st.expander(f"⚠️ {len(saved['issues'])} segnalazioni ESPN/feed"):
+            st.write("\n".join(f"- {item}" for item in saved["issues"][:100]))
 
 
 st.title("🏀 NBA STATS 2.0")
