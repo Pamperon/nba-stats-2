@@ -83,7 +83,7 @@ def fixture_start_rome(fixture):
         return None
 
 
-@st.cache_data(ttl=86400, show_spinner="Calendario NBA…")
+@st.cache_data(ttl=1800, show_spinner="Calendario NBA…")
 def get_fixtures(day_string):
     # Calendar day is Europe/Rome, including daylight-saving transitions.
     local_start = datetime.strptime(day_string, "%Y-%m-%d").replace(tzinfo=ROME_TZ)
@@ -106,6 +106,16 @@ def get_fixtures(day_string):
         if start_rome is not None and start_rome.date().isoformat() == day_string:
             matches.append(fixture)
     return sorted(matches, key=lambda f: fixture_start_rome(f))
+
+
+def fixture_is_completed(fixture):
+    """Hide completed games, not games merely underway."""
+    status = str(fixture.get("statusName") or "").strip().casefold()
+    if status in {"finished", "final", "completed", "ended", "after overtime", "after extra time"}:
+        return True
+    if fixture.get("trueEndTime"):
+        return True
+    return False
 
 
 @st.cache_data(ttl=86400, show_spinner="Quote Bet365…")
@@ -841,12 +851,12 @@ if not API_KEY:
 
 selected_date = st.date_input("Data delle partite (ora italiana)", value=datetime.now(ROME_TZ).date())
 try:
-    fixtures = get_fixtures(selected_date.isoformat())
+    fixtures = [f for f in get_fixtures(selected_date.isoformat()) if not fixture_is_completed(f)]
 except (RuntimeError, ValueError) as exc:
     st.error(f"Calendario non disponibile: {exc}")
     st.stop()
 if not fixtures:
-    st.warning("Nessuna partita NBA trovata per questa data.")
+    st.info("Nessuna partita NBA da mostrare per questa data: le partite terminate vengono escluse.")
     st.stop()
 options = {f"{f.get('participant1Name', '?')} – {f.get('participant2Name', '?')} | {fixture_start_rome(f).strftime('%d/%m/%Y %H:%M')} (Italia)": f for f in fixtures}
 choice = st.selectbox("🏟️ Partita NBA", list(options))
@@ -863,26 +873,36 @@ if "loaded_fixture" not in st.session_state:
     st.session_state.loaded_fixture = None
 if "odds_refresh_versions" not in st.session_state:
     st.session_state.odds_refresh_versions = {}
-left, right = st.columns([2, 1])
-with left:
-    if st.button("📥 Carica quote Bet365", type="primary"):
-        st.session_state.loaded_fixture = fixture_id
-with right:
-    if st.button("🔄 Aggiorna quote della partita"):
-        versions = st.session_state.odds_refresh_versions
-        versions[fixture_id] = versions.get(fixture_id, 0) + 1
-        st.session_state.loaded_fixture = fixture_id
+if st.button("🔄 Carica / Aggiorna quote", type="primary"):
+    # Each click intentionally requests fresh odds; no extra automatic retries.
+    versions = st.session_state.odds_refresh_versions
+    versions[fixture_id] = versions.get(fixture_id, 0) + 1
+    st.session_state.loaded_fixture = fixture_id
 if st.session_state.loaded_fixture != fixture_id:
-    st.info("Premi **Carica quote Bet365** per la partita selezionata. Il calendario non carica automaticamente le quote.")
+    st.info("Premi **Carica / Aggiorna quote** per la partita selezionata. Il calendario non carica automaticamente le quote.")
     st.stop()
 market_label = st.selectbox("📊 Mercato giocatore", list(MARKETS))
 try:
     catalog = get_markets()
     odds = get_odds(fixture_id, st.session_state.odds_refresh_versions.get(fixture_id, 0))
     rows, diag = parse_odds(odds, catalog, market_label)
+    if rows:
+        st.session_state.setdefault("last_valid_odds", {})[fixture_id] = odds
+    else:
+        previous = st.session_state.get("last_valid_odds", {}).get(fixture_id)
+        if previous is not None:
+            old_rows, old_diag = parse_odds(previous, catalog, market_label)
+            if old_rows:
+                odds, rows, diag = previous, old_rows, old_diag
+                st.warning("L'aggiornamento non ha restituito quote utilizzabili per questo mercato: mostro le ultime quote salvate, che potrebbero non essere aggiornate.")
 except (RuntimeError, ValueError) as exc:
-    st.error(f"Quote non disponibili: {exc}")
-    st.stop()
+    previous = st.session_state.get("last_valid_odds", {}).get(fixture_id)
+    if previous is None:
+        st.error(f"Quote non disponibili: {exc}")
+        st.stop()
+    rows, diag = parse_odds(previous, catalog, market_label)
+    odds = previous
+    st.warning("Aggiornamento non riuscito: visualizzo le ultime quote salvate, potenzialmente non aggiornate.")
 if not rows:
     st.warning("Nessuna quota disponibile nel feed per questo mercato.")
     st.stop()
