@@ -869,40 +869,58 @@ if section == "🔎 NBA Value Finder":
     render_value_finder(fixtures, selected_date)
     st.stop()
 
-if "loaded_fixture" not in st.session_state:
-    st.session_state.loaded_fixture = None
+# Conserva in sessione le risposte per tutte le partite già consultate.
+# Cambiare partita o mercato non effettua nuove richieste a OddsPapi.
+if "odds_by_fixture" not in st.session_state:
+    st.session_state.odds_by_fixture = {}
 if "odds_refresh_versions" not in st.session_state:
     st.session_state.odds_refresh_versions = {}
-if st.button("🔄 Carica / Aggiorna quote", type="primary"):
-    # Each click intentionally requests fresh odds; no extra automatic retries.
-    versions = st.session_state.odds_refresh_versions
-    versions[fixture_id] = versions.get(fixture_id, 0) + 1
-    st.session_state.loaded_fixture = fixture_id
-if st.session_state.loaded_fixture != fixture_id:
-    st.info("Premi **Carica / Aggiorna quote** per la partita selezionata. Il calendario non carica automaticamente le quote.")
+
+already_loaded = fixture_id in st.session_state.odds_by_fixture
+button_label = "🔄 Aggiorna quote" if already_loaded else "📥 Carica quote"
+refresh_clicked = st.button(button_label, type="primary")
+if not already_loaded and not refresh_clicked:
+    st.info("Premi **Carica quote** per questa partita. Se torni su una partita già caricata, le quote ricompariranno automaticamente senza nuove chiamate API.")
     st.stop()
+
 market_label = st.selectbox("📊 Mercato giocatore", list(MARKETS))
 try:
     catalog = get_markets()
-    odds = get_odds(fixture_id, st.session_state.odds_refresh_versions.get(fixture_id, 0))
-    rows, diag = parse_odds(odds, catalog, market_label)
-    if rows:
-        st.session_state.setdefault("last_valid_odds", {})[fixture_id] = odds
-    else:
-        previous = st.session_state.get("last_valid_odds", {}).get(fixture_id)
-        if previous is not None:
-            old_rows, old_diag = parse_odds(previous, catalog, market_label)
-            if old_rows:
-                odds, rows, diag = previous, old_rows, old_diag
-                st.warning("L'aggiornamento non ha restituito quote utilizzabili per questo mercato: mostro le ultime quote salvate, che potrebbero non essere aggiornate.")
 except (RuntimeError, ValueError) as exc:
-    previous = st.session_state.get("last_valid_odds", {}).get(fixture_id)
-    if previous is None:
-        st.error(f"Quote non disponibili: {exc}")
-        st.stop()
-    rows, diag = parse_odds(previous, catalog, market_label)
-    odds = previous
-    st.warning("Aggiornamento non riuscito: visualizzo le ultime quote salvate, potenzialmente non aggiornate.")
+    st.error(f"Catalogo mercati non disponibile: {exc}")
+    st.stop()
+
+if refresh_clicked:
+    # Solo un clic esplicito genera una nuova versione della richiesta API.
+    versions = st.session_state.odds_refresh_versions
+    versions[fixture_id] = versions.get(fixture_id, 0) + 1
+    try:
+        incoming = get_odds(fixture_id, versions[fixture_id])
+        # Una risposta valida per almeno uno dei tre mercati viene salvata.
+        has_any_market = any(parse_odds(incoming, catalog, m)[0] for m in MARKETS)
+        if has_any_market:
+            st.session_state.odds_by_fixture[fixture_id] = incoming
+            st.success("Quote caricate e memorizzate per questa partita.")
+        elif already_loaded:
+            st.warning("Il nuovo aggiornamento non contiene quote alternative utilizzabili. Mantengo le quote precedenti della partita.")
+        else:
+            st.warning("La risposta OddsPapi non contiene quote alternative utilizzabili. Puoi riprovare più tardi.")
+    except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+        if already_loaded:
+            st.warning(f"Aggiornamento non riuscito ({exc}). Mantengo le quote precedenti.")
+        else:
+            st.error(f"Caricamento non riuscito: {exc}")
+
+odds = st.session_state.odds_by_fixture.get(fixture_id)
+if odds is None:
+    st.stop()
+if not refresh_clicked:
+    st.caption("Quote già caricate in questa sessione · Nessuna nuova chiamata API. Premi **Aggiorna quote** per richiederne di nuove.")
+try:
+    rows, diag = parse_odds(odds, catalog, market_label)
+except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+    st.error(f"Impossibile interpretare le quote salvate: {exc}")
+    st.stop()
 if not rows:
     st.warning("Nessuna quota disponibile nel feed per questo mercato.")
     st.stop()
