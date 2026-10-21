@@ -567,27 +567,30 @@ def auto_filter_suspicious_lines(player_rows):
 
 
 def finder_estimate_probability(log, stat, line, side):
-    """Heuristic, regular-season only. Not a calibrated predictive model."""
+    """Stima empirica regolarizzata per ciascuna soglia; NON calibrata.
+
+    Prior di Jeffreys Beta(0.5, 0.5), anziche' 24 pseudopartite al 50%.
+    Una frequenza 0/N resta bassa, N/N resta alta; nessuna garanzia predittiva.
+    La finestra recente e' parte della stagione: il suo peso (20%) e' una
+    scelta provvisoria, da validare su giornate future senza riottimizzarla.
+    """
     if log.empty or stat not in log.columns:
         return None
     log = log.copy()
     log[stat] = pd.to_numeric(log[stat], errors="coerce")
     log["GAME_DATE"] = pd.to_datetime(log["GAME_DATE"], errors="coerce", utc=True)
     log = log.dropna(subset=[stat, "GAME_DATE"]).sort_values("GAME_DATE", ascending=False)
-    if len(log) < 15:
+    if len(log) < 15 or abs(line % 1 - 0.5) > 1e-6:
         return None
     values = log[stat]
-    # Half-point markets have no pushes. Skip other lines to avoid settlement ambiguity.
-    if abs(line % 1 - 0.5) > 1e-6:
-        return None
     wins = (values > line) if side == "Over" else (values < line)
-    season_rate = float(wins.mean())
     recent = wins.head(min(20, len(wins)))
+    season_rate = float(wins.mean())
     recent_rate = float(recent.mean())
-    # Bayesian smoothing toward 50% plus modest recency adjustment.
-    # This is a ranking heuristic, NOT a statistically calibrated probability.
-    smooth = (float(wins.sum()) + 12.0) / (len(wins) + 24.0)
-    estimate = 0.75 * smooth + 0.25 * recent_rate
+    # Jeffreys smoothing: 0/20 -> 2.38%, 20/20 -> 97.62%.
+    season_smoothed = (float(wins.sum()) + 0.5) / (len(wins) + 1.0)
+    recent_smoothed = (float(recent.sum()) + 0.5) / (len(recent) + 1.0)
+    estimate = 0.80 * season_smoothed + 0.20 * recent_smoothed
     return {"estimate": estimate, "season": season_rate, "recent": recent_rate,
             "n": len(wins), "n_recent": len(recent), "recent_hits": int(recent.sum()),
             "avg": float(values.mean())}
@@ -778,8 +781,8 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
                         prob = estimate["estimate"]
                         row["Prob. stimata %"] = round(prob * 100, 1)
                         row["Value stimato %"] = round((prob * price - 1) * 100, 1)
-                        row["Stato analisi"] = "Valutabile (stima euristica)"
-                        row["Nota"] = "Stima NON calibrata; verifica quota e disponibilità"
+                        row["Stato analisi"] = "Valutabile (stima empirica)"
+                        row["Nota"] = "Stima empirica NON calibrata; verifica quota e disponibilità"
             results.append(row)
     if progress_callback:
         progress_callback(1.0, "Analisi completata")
@@ -833,7 +836,7 @@ def render_value_finder(fixtures, selected_date):
     st.download_button("⬇️ Scarica CSV COMPLETO — tutte le linee",
                        df.to_csv(index=False).encode("utf-8-sig"),
                        file_name="nba_value_finder_tutte_le_linee.csv", mime="text/csv")
-    valid = df[df["Stato analisi"] == "Valutabile (stima euristica)"].copy()
+    valid = df[df["Stato analisi"] == "Valutabile (stima empirica)"].copy()
     valid = valid[(valid["Quota"] >= odds_min) & (valid["Quota"] <= odds_max) &
                   (valid["Value stimato %"] >= min_value)]
     mode = st.radio("Ordina la classifica", ["Probabilità stimata", "Value stimato"], horizontal=True)
@@ -843,7 +846,7 @@ def render_value_finder(fixtures, selected_date):
     st.dataframe(valid.head(10), hide_index=True, width="stretch")
     st.write(f"**Tutte le {len(df)} linee ricevute**, incluse quelle non valutabili")
     st.dataframe(df, hide_index=True, width="stretch")
-    st.caption("Ultime 5/10/20 e stagione sono frequenze osservate. La probabilità è l'euristica precedente: 75% frequenza stagionale smussata verso 50%, 25% ultime 20. Minuti e variabilità sono mostrati ma NON modificano ancora la stima: serve validazione su più partite.")
+    st.caption("Ultime 5/10/20 e stagione sono frequenze osservate. La probabilità è una stima empirica NON calibrata: 80% frequenza stagionale e 20% ultime 20, con regolarizzazione Beta(0,5; 0,5). Le ultime 20 sono incluse nella stagione. Minuti e variabilità sono mostrati ma NON modificano ancora la stima: serve validazione su più partite.")
     with st.expander("🔬 Diagnostica OddsPapi e linee segnalate"):
         audit = pd.DataFrame(saved.get("raw_audit", []))
         if not audit.empty:
