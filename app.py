@@ -13,13 +13,12 @@ logger = logging.getLogger("nba_stats_diagnostics")
 BASE = "https://api.oddspapi.io/v4"
 ROME_TZ = ZoneInfo("Europe/Rome")
 MARKETS = {
-    "Punti (PTS)": ("playertotals-points", "players-points"),
-    "Rimbalzi (REB)": ("playertotals-rebounds", "players-rebounds"),
-    "Assist (AST)": ("playertotals-assists", "players-assists"),
+    "Punti (PTS)": ("players-points",),
+    "Rimbalzi (REB)": ("players-rebounds",),
+    "Assist (AST)": ("players-assists",),
 }
 STATS = {"Punti (PTS)": "PTS", "Rimbalzi (REB)": "REB", "Assist (AST)": "AST"}
-# Soglie alternative Bet365 verificate dall'utente. Il mercato principale
-# Over/Under può usare linee diverse e viene conservato separatamente.
+# Solo mercati alternativi Bet365 (es. 20+ = Over 19,5).
 BET365_ALT_LINES = {
     "PTS": {float(n) + 0.5 for n in range(4, 100, 5)},
     "REB": {2.5, 4.5, 6.5, 9.5, 12.5, 14.5, 16.5, 19.5},
@@ -28,13 +27,9 @@ BET365_ALT_LINES = {
 
 
 def bet365_line_allowed(row, stat):
-    # Le soglie fornite si riferiscono ai mercati alternativi (+).
-    # Le linee principali Over/Under non devono essere eliminate per errore.
-    if abs(float(row["Linea"]) - 0.5) < 1e-6:
-        return False
-    if row.get("Tipo") == "Over/Under":
-        return True
-    return round(float(row["Linea"]), 2) in BET365_ALT_LINES[stat]
+    return (row.get("Tipo") == "Soglia +" and
+            round(float(row["Linea"]), 2) in BET365_ALT_LINES[stat] and
+            isinstance(row.get("Over"), (int, float)))
 
 
 try:
@@ -135,31 +130,21 @@ def parse_odds(data, catalog, market_label):
         if kind not in MARKETS[market_label]:
             continue
         diag["Mercati del tipo richiesto"] += 1
-        is_alternative = kind.startswith("players-")
+        # Never combine alternative '+' quotes with main Over/Under prices.
         active_market = market_data.get("marketActive") is True
-        if is_alternative:
-            diag["Mercati alternativi (+)"] += 1
-            diag["Mercati alternativi attivi" if active_market else "Mercati alternativi inattivi"] += 1
+        diag["Mercati alternativi (+)"] += 1
+        diag["Mercati alternativi attivi" if active_market else "Mercati alternativi inattivi"] += 1
         if not active_market:
             diag.setdefault("Mercati inattivi esclusi", 0)
             diag["Mercati inattivi esclusi"] += 1
-            continue  # Apply active-market requirement to BOTH main and alternative markets.
+            continue
         names = {str(o.get("outcomeId")): str(o.get("outcomeName", "")) for o in definition.get("outcomes", [])}
         for outcome_id, outcome in (market_data.get("outcomes") or {}).items():
             name = names.get(str(outcome_id), "")
-            if is_alternative:
-                match = re.fullmatch(r"\s*(\d+)\+\s*", name)
-                if not match:
-                    continue
-                line, side = int(match.group(1)) - 0.5, "Over"
-            else:
-                if name.lower() not in ("over", "under"):
-                    continue
-                try:
-                    line = float(definition["handicap"])
-                except (ValueError, KeyError, TypeError):
-                    continue
-                side = name.title()
+            match = re.fullmatch(r"\s*(\d+)\+\s*", name)
+            if not match:
+                continue
+            line = int(match.group(1)) - 0.5
             for player_id, player in (outcome.get("players") or {}).items():
                 if not player.get("active") or not player.get("playerName"):
                     continue
@@ -167,17 +152,9 @@ def parse_odds(data, catalog, market_label):
                 if not isinstance(price, (int, float)) or price <= 1:
                     continue
                 key = (str(player_id), line)
-                row = rows.setdefault(key, {"Giocatore": player["playerName"], "Linea": line,
-                    "Over": None, "Under": None, "Principale": False, "Tipo": "Soglia +" if is_alternative else "Over/Under",
-                    "Stato API": "Mercato inattivo" if not active_market else "Attivo"})
-                # Main O/U takes precedence when both markets describe the same line.
-                if row[side] is None or not is_alternative:
-                    row[side] = price
-                if not is_alternative:
-                    row["Tipo"] = "Over/Under"
-                    row["Stato API"] = "Attivo"
-                if player.get("mainLine"):
-                    row["Principale"] = True
+                rows[key] = {"Giocatore": player["playerName"], "Linea": line,
+                             "Over": float(price), "Tipo": "Soglia +",
+                             "Stato API": "Attivo"}
     return sorted(rows.values(), key=lambda r: (r["Giocatore"], r["Linea"])), diag
 
 
@@ -416,17 +393,11 @@ def analysis_row(title, data, stat, line):
     values = data[stat].dropna()
     n = len(values)
     over = int((values > line).sum())
-    under = int((values < line).sum())
-    push = n - over - under
-    row = {"Periodo": title, "Partite": n, "Over": f"{over}/{n}" if n else "—",
-           "% Over": f"{over/n:.1%}" if n else "—",
-           "Under": f"{under}/{n}" if n else "—",
-           "% Under": f"{under/n:.1%}" if n else "—",
-           "Media": f"{values.mean():.1f}" if n else "—",
-           "Media - linea": f"{values.mean()-line:+.1f}" if n else "—"}
-    if push:
-        row["Push"] = push
-    return row
+    return {"Periodo": title, "Partite": n,
+            "Over": f"{over}/{n}" if n else "—",
+            "% Over": f"{over/n:.1%}" if n else "—",
+            "Media": f"{values.mean():.1f}" if n else "—",
+            "Media - linea": f"{values.mean()-line:+.1f}" if n else "—"}
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="Recupero storico ESPN…")
@@ -568,8 +539,8 @@ def selected_game_log(athlete_id, season, mode, team_id=None):
 def auto_filter_suspicious_lines(player_rows):
     """Remove a lower threshold if its Over price exceeds the next higher Over.
 
-    Compare adjacent Over quotes, repeating after each removal. Preserve Under-only
-    rows. A monotonic feed is not proof that Bet365 currently offers the quote.
+    Compare adjacent alternative Over quotes, repeating after each removal.
+    A monotonic feed is not proof that Bet365 currently offers the quote.
     """
     ordered = sorted(player_rows, key=lambda r: r["Linea"])
     kept = list(ordered)
@@ -715,8 +686,17 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
                         filter_audit.append({"Partita": match_name, "Giocatore": player_name,
                                              "Mercato": STATS[market_label], "Linea": row["Linea"],
                                              "Motivo": "Linea 0,5 esclusa per scelta: non disponibile su Bet365"})
-                    filtered, excluded = auto_filter_suspicious_lines(
-                        [r for r in group if abs(float(r["Linea"]) - 0.5) >= 1e-6])
+                    eligible = []
+                    for r in group:
+                        if abs(float(r["Linea"]) - 0.5) < 1e-6:
+                            continue
+                        if not bet365_line_allowed(r, STATS[market_label]):
+                            filter_audit.append({"Partita": match_name, "Giocatore": player_name,
+                                                 "Mercato": STATS[market_label], "Linea": r["Linea"],
+                                                 "Motivo": "Soglia alternativa fuori schema Bet365 verificato"})
+                            continue
+                        eligible.append(r)
+                    filtered, excluded = auto_filter_suspicious_lines(eligible)
                     for row in excluded:
                         filter_audit.append({"Partita": match_name, "Giocatore": player_name,
                                              "Mercato": STATS[market_label], "Linea": row["Linea"],
@@ -727,7 +707,7 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
                                                  "Mercato": STATS[market_label], "Linea": row["Linea"],
                                                  "Motivo": "Soglia alternativa fuori schema Bet365 verificato"})
                             continue
-                        for side in ("Over", "Under"):
+                        for side in ("Over",):
                             price = row.get(side)
                             if isinstance(price, (int, float)) and odds_min <= price <= odds_max:
                                 odds_rows.append((match_name, player_name, market_label, row["Linea"], side, float(price)))
@@ -909,35 +889,33 @@ if not rows:
 player_name = st.selectbox("🏀 Giocatore", sorted({r["Giocatore"] for r in rows}))
 player_rows = [r for r in rows if r["Giocatore"] == player_name]
 st.subheader(f"{player_name} · {market_label}")
-st.caption("Le soglie '+' mostrano soltanto la quota Over (20+ = Over 19,5). Nessuna quota Under viene inventata.")
+st.caption("Solo mercati alternativi Over (+): 20+ equivale a Over 19,5. Mercati principali e Under esclusi.")
 st.caption("Controllo automatico attivo: linea 0,5 sempre esclusa; se una soglia inferiore ha una quota Over maggiore della successiva, viene esclusa. La disponibilità su Bet365 non è garantita.")
 removed_half = [r for r in player_rows if abs(float(r["Linea"]) - 0.5) < 1e-6]
 player_rows = [r for r in player_rows if abs(float(r["Linea"]) - 0.5) >= 1e-6]
 if removed_half:
     st.caption(f"Escluse {len(removed_half)} linee 0,5 (non disponibili su Bet365 secondo la verifica effettuata).")
+out_of_schema = [r for r in player_rows if not bet365_line_allowed(r, STATS[market_label])]
+player_rows = [r for r in player_rows if bet365_line_allowed(r, STATS[market_label])]
 player_rows, excluded_rows = auto_filter_suspicious_lines(player_rows)
 if excluded_rows:
     st.caption(f"Escluse automaticamente {len(excluded_rows)} linee con quote Over incoerenti.")
     with st.expander("🔎 Linee escluse per quote incoerenti"):
-        st.dataframe(pd.DataFrame(excluded_rows)[["Linea", "Over", "Under", "Tipo"]], hide_index=True, width="stretch")
-out_of_schema = [r for r in player_rows if not bet365_line_allowed(r, STATS[market_label])]
-player_rows = [r for r in player_rows if bet365_line_allowed(r, STATS[market_label])]
+        st.dataframe(pd.DataFrame(excluded_rows)[["Linea", "Over", "Tipo"]], hide_index=True, width="stretch")
 if out_of_schema:
     with st.expander(f"📋 {len(out_of_schema)} soglie alternative fuori schema Bet365"):
-        st.dataframe(pd.DataFrame(out_of_schema)[["Giocatore", "Linea", "Over", "Under", "Tipo"]],
+        st.dataframe(pd.DataFrame(out_of_schema)[["Giocatore", "Linea", "Over", "Tipo"]],
                      hide_index=True, width="stretch")
-        st.caption("Le soglie principali Over/Under rimangono visibili anche se diverse dalle soglie alternative.")
+        st.caption("Le soglie non previste dallo schema alternativo sono escluse.")
 if not player_rows:
     st.warning("Nessuna linea rimasta dopo i controlli automatici.")
     st.stop()
 frame = pd.DataFrame(player_rows).sort_values("Linea")
-frame["Principale"] = frame["Principale"].map({True: "Sì", False: ""})
-st.dataframe(frame[["Linea", "Over", "Under", "Principale"]],
+st.dataframe(frame[["Linea", "Over"]],
     hide_index=True, width="stretch",
     column_config={"Linea": st.column_config.NumberColumn(format="%.1f"),
-                   "Over": st.column_config.NumberColumn(format="%.3f"),
-                   "Under": st.column_config.NumberColumn(format="%.3f")})
-st.download_button("⬇️ Scarica CSV quote", frame[["Giocatore", "Linea", "Over", "Under", "Principale"]].to_csv(index=False).encode("utf-8-sig"),
+                   "Over": st.column_config.NumberColumn(format="%.3f")})
+st.download_button("⬇️ Scarica CSV quote", frame[["Giocatore", "Linea", "Over"]].to_csv(index=False).encode("utf-8-sig"),
                    file_name="nba_stats_quote.csv", mime="text/csv")
 with st.expander("🔎 Diagnostica mercati (nessuna richiesta OddsPapi aggiuntiva)"):
     st.json(diag)
@@ -992,13 +970,11 @@ if st.session_state.get("stats_selection") == (player_name, season, competition_
                                "le statistiche dell'intera stagione restano disponibili.")
                 periods.extend([(f"{competition_mode} {season}", log),
                                 (f"{competition_mode} {previous_season}", previous_log)])
-                st.caption(f"Linea {line:g} · Over: risultato > {line:g} · Under: risultato < {line:g}")
+                st.caption(f"Linea {line:g} · Over: risultato > {line:g}")
                 for period_title, period_log in periods:
                     values = period_log[stat].dropna() if not period_log.empty else pd.Series(dtype=float)
                     count = len(values)
                     over = int((values > line).sum())
-                    under = int((values < line).sum())
-                    pushes = count - over - under
                     with st.container(border=True):
                         first, second = st.columns([2, 1])
                         with first:
@@ -1006,13 +982,9 @@ if st.session_state.get("stats_selection") == (player_name, season, competition_
                             if count:
                                 st.markdown(
                                     f'<span style="display:inline-block;background:#dcfce7;color:#166534;padding:5px 12px;border-radius:20px;margin-right:8px;font-weight:600">'
-                                    f'↑ {over/count:.0%} Over ({over}/{count})</span>'
-                                    f'<span style="display:inline-block;background:#fee2e2;color:#991b1b;padding:5px 12px;border-radius:20px;font-weight:600">'
-                                    f'↓ {under/count:.0%} Under ({under}/{count})</span>',
+                                    f'↑ {over/count:.0%} Over ({over}/{count})</span>',
                                     unsafe_allow_html=True,
                                 )
-                                if pushes:
-                                    st.caption(f"Push: {pushes} (risultato esattamente uguale alla linea)")
                             else:
                                 st.caption("Nessuna partita disponibile")
                         with second:
