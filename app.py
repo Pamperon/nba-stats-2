@@ -791,6 +791,69 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
     return results, issues, quote_count, len(props_by_player), raw_audit, filter_audit
 
 
+
+
+def _ratio_hits(value):
+    """Parse observed hit count; leave missing/malformed values unavailable."""
+    match = re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", str(value))
+    if not match:
+        return None
+    hits, total = map(int, match.groups())
+    return (hits, total) if total > 0 and 0 <= hits <= total else None
+
+
+def rank_single_candidates(frame, minimum_odds=1.50, maximum_odds=2.10):
+    """Transparent screening, NOT a validated predictive model."""
+    if frame.empty:
+        return frame.copy()
+    data = frame[frame["Stato analisi"] == "Valutabile (stima empirica)"].copy()
+    for column in ("Quota", "Prob. stimata %", "Partite", "Stagione %", "Minuti medi", "Minuti ultime 5"):
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = data.dropna(subset=["Quota", "Prob. stimata %"])
+    data = data[data["Quota"].between(minimum_odds, maximum_odds)].copy()
+    if data.empty:
+        return data
+    for window in (5, 10, 20):
+        data[f"_h{window}"] = data[f"Ultime {window}"].map(_ratio_hits)
+        data[f"_p{window}"] = data[f"_h{window}"].map(lambda x: x[0]/x[1] if x and x[1] == window else float('nan'))
+    data["Prob. pareggio %"] = (100 / data["Quota"]).round(1)
+    data["Margine stimato pp"] = (data["Prob. stimata %"] - data["Prob. pareggio %"]).round(1)
+    data["Minuti stabili"] = (
+        data["Minuti medi"].notna() & (data["Minuti medi"] >= 20) &
+        data["Minuti ultime 5"].notna() &
+        (data["Minuti ultime 5"] >= 0.8 * data["Minuti medi"])
+    )
+    data["Criteri rispettati"] = (
+        (data["Prob. stimata %"] >= 70).astype(int) +
+        (data["_p5"] >= 0.8).astype(int) +
+        (data["_p10"] >= 0.8).astype(int) +
+        (data["_p20"] >= 0.8).astype(int) +
+        (data["Stagione %"] >= 70).astype(int) +
+        (data["Partite"] >= 20).astype(int) +
+        data["Minuti stabili"].astype(int) +
+        (data["Margine stimato pp"] >= 3).astype(int)
+    )
+    data["Esito screening"] = data.apply(
+        lambda row: "Candidata da verificare" if (
+            row["Criteri rispettati"] == 8 and row["Prob. stimata %"] >= 75
+        ) else "Non supera tutti i criteri", axis=1
+    )
+    return data.sort_values(
+        ["Criteri rispettati", "Prob. stimata %", "Margine stimato pp", "Partite"],
+        ascending=[False, False, False, False]
+    ).drop(columns=["_h5", "_h10", "_h20", "_p5", "_p10", "_p20"])
+
+
+def csv_excel_friendly(frame):
+    """Prevent Excel interpreting 5/5 as a date in exported CSV."""
+    result = frame.copy()
+    for column in ("Ultime 5", "Ultime 10", "Ultime 20"):
+        if column in result:
+            result[column] = result[column].map(
+                lambda value: str(value).replace("/", " su ") if _ratio_hits(value) else value
+            )
+    return result.to_csv(index=False).encode("utf-8-sig")
+
 FINDER_MODEL_VERSION = "2.1-empirica-jeffreys-20261021"
 
 def render_value_finder(fixtures, selected_date):
@@ -841,8 +904,35 @@ def render_value_finder(fixtures, selected_date):
         return
     df = pd.DataFrame(rows)
     st.download_button("⬇️ Scarica CSV COMPLETO — tutte le linee",
-                       df.to_csv(index=False).encode("utf-8-sig"),
+                       csv_excel_friendly(df),
                        file_name="nba_value_finder_tutte_le_linee_modello_2_1.csv", mime="text/csv")
+    st.divider()
+    st.subheader("🎯 Singola del giorno — screening statistico")
+    st.caption("Tutti e tre i mercati: PTS, REB, AST. La classifica non garantisce vincite e NON verifica automaticamente infortuni, quintetti o quote live.")
+    a, b = st.columns(2)
+    with a:
+        single_min = st.number_input("Quota minima singola", min_value=1.01, max_value=10.0, value=1.50, step=0.05, key="single_min")
+    with b:
+        single_max = st.number_input("Quota massima singola", min_value=1.01, max_value=20.0, value=2.10, step=0.05, key="single_max")
+    if single_min <= single_max:
+        ranked = rank_single_candidates(df, float(single_min), float(single_max))
+        shortlist = ranked[ranked["Esito screening"] == "Candidata da verificare"] if not ranked.empty else ranked
+        if shortlist.empty:
+            st.warning("Nessuna singola supera tutti i criteri oggi. Non forzare una selezione.")
+        else:
+            pick = shortlist.iloc[0]
+            st.success(f"Prima candidata da verificare: {pick['Giocatore']} · {pick['Scelta']} {pick['Linea']} {pick['Mercato']} · quota {pick['Quota']:.2f}")
+            st.write(f"{pick['Partita']} · probabilità modello **{pick['Prob. stimata %']:.1f}%** (NON calibrata) · quota di pareggio **{pick['Prob. pareggio %']:.1f}%**")
+            st.caption("Verifica disponibilità, minutaggio previsto, quote effettive e data del campione storico prima di considerare la selezione.")
+            st.dataframe(shortlist.head(10), hide_index=True, width="stretch")
+        if not ranked.empty:
+            with st.expander(f"Classifica completa delle {len(ranked)} linee nella fascia quota scelta"):
+                st.dataframe(ranked, hide_index=True, width="stretch")
+            st.download_button("⬇️ Scarica screening singole CSV", csv_excel_friendly(ranked),
+                               file_name="nba_stats_screening_singole.csv", mime="text/csv")
+    else:
+        st.warning("La quota minima deve essere inferiore o uguale alla massima.")
+    st.divider()
     valid = df[df["Stato analisi"] == "Valutabile (stima empirica)"].copy()
     valid = valid[(valid["Quota"] >= odds_min) & (valid["Quota"] <= odds_max) &
                   (valid["Value stimato %"] >= min_value)]
