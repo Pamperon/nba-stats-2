@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="NBA STATS 3.1", page_icon="🏀", layout="wide")
+st.set_page_config(page_title="NBA STATS 3.2", page_icon="🏀", layout="wide")
 logger = logging.getLogger("nba_stats_diagnostics")
 BASE = "https://api.oddspapi.io/v4"
 ROME_TZ = ZoneInfo("Europe/Rome")
@@ -1305,16 +1305,103 @@ def show_history():
 # NBA STATS 3.1 — layout e navigazione centralizzata
 st.markdown("""
 <style>
-.stApp {background: #0b1220; color: #e8eef8;}
-[data-testid="stSidebar"] {background: #111c2f; border-right: 1px solid #24354d;}
-.block-container {max-width: 1480px; padding-top: 1.25rem; padding-bottom: 3rem;}
-h1,h2,h3 {color: #f1f5fc !important; letter-spacing: -.025em;}
-[data-testid="stMetric"] {background:#142239; border:1px solid #283a54; border-radius:13px; padding:15px;}
-[data-testid="stMetricLabel"] {color:#aabbd2;}
-[data-testid="stMetricValue"] {color:#f8fbff;}
-div[data-testid="stVerticalBlockBorderWrapper"] > div {border-color:#30435d;}
-.stButton button[kind="primary"] {background:#2563eb; border:0; color:white; font-weight:700; border-radius:10px;}
-.stDownloadButton button {border-radius:9px;}
+/* NBA STATS 3.2: tema coerente, alto contrasto e controlli leggibili. */
+:root { color-scheme: dark; }
+html, body, [data-testid="stAppViewContainer"], .stApp,
+[data-testid="stMain"], [data-testid="stMainBlockContainer"] {
+    background: #0b1220 !important; color: #edf4ff !important;
+}
+[data-testid="stHeader"] { background: #0b1220 !important; height: 2.6rem !important; }
+[data-testid="stDecoration"] { display: none !important; }
+[data-testid="stToolbar"] { background: transparent !important; }
+/* Manteniamo accessibile il menu di Streamlit, senza mascherare funzionalità di sicurezza. */
+.block-container { max-width: 1390px !important; padding: 1.15rem 2.2rem 3rem !important; }
+[data-testid="stSidebar"], [data-testid="stSidebarContent"] {
+    background: #142238 !important; border-right: 1px solid #34445d !important;
+}
+[data-testid="stSidebar"] { min-width: 292px !important; }
+[data-testid="stSidebar"] *:not(svg):not(path),
+[data-testid="stSidebar"] label, [data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span, [data-testid="stSidebar"] small,
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+    color: #e2eaf7 !important;
+}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { color: #b8c8de !important; }
+[data-testid="stSidebar"] hr { border-color: #33445f !important; }
+[data-testid="stSidebar"] [data-testid="stExpander"] {
+    background: #1a2c46 !important; border: 1px solid #3b5271 !important;
+    border-radius: 10px !important;
+}
+/* Tipografia: contrasto e gerarchia visiva */
+h1, h2, h3, h4, h5, h6 { color: #f8fbff !important; letter-spacing: -.025em !important; }
+h1 { font-size: clamp(1.75rem, 2.8vw, 2.4rem) !important; }
+h2 { font-size: 1.6rem !important; }
+h3 { font-size: 1.28rem !important; }
+.stApp p, .stApp label, .stApp li, .stApp span, .stApp div[data-testid="stMarkdownContainer"] {
+    color: #e2eaf7;
+}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p,
+[data-testid="stCaptionContainer"] span { color: #b9c9de !important; opacity: 1 !important; }
+/* Inputs: background scuro anche con tema Streamlit chiaro configurato */
+[data-testid="stDateInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextInput"] input,
+[data-testid="stSelectbox"] [data-baseweb="select"],
+[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+[data-testid="stNumberInput"] [data-baseweb="input"],
+[data-testid="stDateInput"] [data-baseweb="input"] {
+    background: #233753 !important; color: #fff !important;
+    border-color: #506888 !important; border-radius: 8px !important;
+}
+[data-testid="stDateInput"] input, [data-testid="stNumberInput"] input,
+[data-testid="stTextInput"] input, [data-testid="stSelectbox"] input,
+[data-testid="stSelectbox"] span { color: #fff !important; -webkit-text-fill-color: #fff !important; }
+[data-testid="stNumberInput"] button, [data-testid="stDateInput"] button {
+    background: #2b4262 !important; color: #fff !important;
+}
+[data-testid="stSelectbox"] svg, [data-testid="stDateInput"] svg,
+[data-testid="stNumberInput"] svg { fill: #e2eaf7 !important; color: #e2eaf7 !important; }
+/* Slider: indicazioni sempre leggibili */
+[data-testid="stSlider"] [data-testid="stTickBar"] { color: #e2eaf7 !important; }
+/* Metriche e card */
+[data-testid="stMetric"] {
+    background: #172a43 !important; border: 1px solid #334e70 !important;
+    border-radius: 14px !important; padding: 1rem 1.15rem !important;
+}
+[data-testid="stMetricLabel"] *, [data-testid="stMetricLabel"] { color: #b8c9df !important; }
+[data-testid="stMetricValue"] *, [data-testid="stMetricValue"] { color: #fff !important; }
+[data-testid="stVerticalBlockBorderWrapper"] > div { border-color: #385272 !important; }
+/* Pulsanti e azioni */
+.stButton button[kind="primary"], [data-testid="stBaseButton-primary"] {
+    background: #2874ed !important; border: 1px solid #5192ff !important;
+    color: #fff !important; font-weight: 700 !important;
+    border-radius: 10px !important; min-height: 2.8rem !important;
+}
+.stButton button[kind="primary"] *, [data-testid="stBaseButton-primary"] * { color: #fff !important; }
+.stButton button:hover { filter: brightness(1.13); }
+.stDownloadButton button, [data-testid="stBaseButton-secondary"] {
+    border-radius: 9px !important; background: #203654 !important;
+    border: 1px solid #4c6687 !important; color: #f3f7ff !important;
+}
+.stDownloadButton button * { color: #f3f7ff !important; }
+/* Tabelle e pannelli di messaggio */
+[data-testid="stDataFrame"], [data-testid="stTable"] { border: 1px solid #324b69; border-radius: 10px; }
+[data-testid="stAlert"] { border-radius: 10px !important; }
+[data-testid="stAlert"] p, [data-testid="stAlert"] span { color: #edf4ff !important; }
+/* Navigazione orizzontale più compatta */
+[data-testid="stRadio"] [role="radiogroup"] { gap: .65rem !important; flex-wrap: wrap !important; }
+[data-testid="stRadio"] [role="radiogroup"] label {
+    padding: .45rem .85rem !important; background: #1b304d !important;
+    border: 1px solid #3c5577 !important; border-radius: 9px !important;
+}
+[data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) {
+    background: #234d8c !important; border-color: #5c9bff !important;
+}
+[data-testid="stRadio"] [role="radiogroup"] label p { color: #f5f9ff !important; }
+@media (max-width: 760px) {
+    .block-container { padding: 1rem .9rem 2.5rem !important; }
+    h1 { font-size: 1.65rem !important; }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1348,8 +1435,8 @@ def current_nba_season(day):
 
 season = current_nba_season(selected_date)
 
-st.markdown("# 🏀 NBA STATS  ·  PRO ANALYTICS")
-st.caption("VALUE FINDER 3.1  /  OddsPapi Bet365 + ESPN  /  Analisi NBA")
+st.markdown("# 🏀 NBA STATS | PRO ANALYTICS")
+st.caption("VALUE FINDER 3.2  ·  OddsPapi Bet365 + ESPN  ·  Analisi NBA")
 page = st.radio("Sezioni", ["🏠 Dashboard", "🎯 Value Finder", "📊 Player Stats"], horizontal=True, label_visibility="collapsed")
 
 # Recupero calendario condiviso; la scansione delle quote avviene SOLO al clic.
