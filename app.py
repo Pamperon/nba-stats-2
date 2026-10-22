@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="NBA STATS 2.0", page_icon="🏀", layout="wide")
+st.set_page_config(page_title="NBA STATS 3.0", page_icon="🏀", layout="wide")
 logger = logging.getLogger("nba_stats_diagnostics")
 BASE = "https://api.oddspapi.io/v4"
 ROME_TZ = ZoneInfo("Europe/Rome")
@@ -956,231 +956,424 @@ def render_value_finder(fixtures, selected_date):
             st.write("\n".join(f"- {item}" for item in saved["issues"][:100]))
 
 
-st.title("🏀 NBA STATS 2.0")
-st.caption("Quote Bet365 Italia tramite OddsPapi · Statistiche NBA da ESPN (fonte gratuita)")
-st.info("Le quote provengono da OddsPapi. Le anomalie vengono segnalate e documentate con una diagnostica del feed; la disponibilità effettiva va verificata su Bet365.")
+
+# NBA STATS 3.0 — Presentation layer. The data collectors and probability estimator
+# above are unchanged from 2.0. Screening is heuristic and not calibrated.
+from io import BytesIO
+
+
+def show_legacy_player(fixtures, selected_date):
+    """Retain the existing player/market/ESPN diagnostics workflow."""
+    options = {f"{f.get('participant1Name', '?')} – {f.get('participant2Name', '?')} | {fixture_start_rome(f).strftime('%d/%m/%Y %H:%M')} (Italia)": f for f in fixtures}
+    choice = st.selectbox("Partita", list(options), key="player_fixture")
+    fixture_id = str(options[choice]["fixtureId"])
+    if "odds_by_fixture" not in st.session_state:
+        st.session_state.odds_by_fixture = {}
+    if "odds_refresh_versions" not in st.session_state:
+        st.session_state.odds_refresh_versions = {}
+
+    already_loaded = fixture_id in st.session_state.odds_by_fixture
+    button_label = "🔄 Aggiorna quote" if already_loaded else "📥 Carica quote"
+    refresh_clicked = st.button(button_label, type="primary")
+    if not already_loaded and not refresh_clicked:
+        st.info("Premi **Carica quote** per questa partita. Se torni su una partita già caricata, le quote ricompariranno automaticamente senza nuove chiamate API.")
+        st.stop()
+
+    market_label = st.selectbox("📊 Mercato giocatore", list(MARKETS))
+    try:
+        catalog = get_markets()
+    except (RuntimeError, ValueError) as exc:
+        st.error(f"Catalogo mercati non disponibile: {exc}")
+        st.stop()
+
+    if refresh_clicked:
+        # Solo un clic esplicito genera una nuova versione della richiesta API.
+        versions = st.session_state.odds_refresh_versions
+        versions[fixture_id] = versions.get(fixture_id, 0) + 1
+        try:
+            incoming = get_odds(fixture_id, versions[fixture_id])
+            # Una risposta valida per almeno uno dei tre mercati viene salvata.
+            has_any_market = any(parse_odds(incoming, catalog, m)[0] for m in MARKETS)
+            if has_any_market:
+                st.session_state.odds_by_fixture[fixture_id] = incoming
+                st.success("Quote caricate e memorizzate per questa partita.")
+            elif already_loaded:
+                st.warning("Il nuovo aggiornamento non contiene quote alternative utilizzabili. Mantengo le quote precedenti della partita.")
+            else:
+                st.warning("La risposta OddsPapi non contiene quote alternative utilizzabili. Puoi riprovare più tardi.")
+        except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+            if already_loaded:
+                st.warning(f"Aggiornamento non riuscito ({exc}). Mantengo le quote precedenti.")
+            else:
+                st.error(f"Caricamento non riuscito: {exc}")
+
+    odds = st.session_state.odds_by_fixture.get(fixture_id)
+    if odds is None:
+        st.stop()
+    if not refresh_clicked:
+        st.caption("Quote già caricate in questa sessione · Nessuna nuova chiamata API. Premi **Aggiorna quote** per richiederne di nuove.")
+    try:
+        rows, diag = parse_odds(odds, catalog, market_label)
+    except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+        st.error(f"Impossibile interpretare le quote salvate: {exc}")
+        st.stop()
+    if not rows:
+        st.warning("Nessuna quota disponibile nel feed per questo mercato.")
+        st.stop()
+    player_name = st.selectbox("🏀 Giocatore", sorted({r["Giocatore"] for r in rows}))
+    player_rows = [r for r in rows if r["Giocatore"] == player_name]
+    st.subheader(f"{player_name} · {market_label}")
+    st.caption("Solo mercati alternativi Over (+): 20+ equivale a Over 19,5. Mercati principali e Under esclusi.")
+    st.caption("Controllo automatico attivo: linea 0,5 sempre esclusa; se una soglia inferiore ha una quota Over maggiore della successiva, viene esclusa. La disponibilità su Bet365 non è garantita.")
+    removed_half = [r for r in player_rows if abs(float(r["Linea"]) - 0.5) < 1e-6]
+    player_rows = [r for r in player_rows if abs(float(r["Linea"]) - 0.5) >= 1e-6]
+    if removed_half:
+        st.caption(f"Escluse {len(removed_half)} linee 0,5 (non disponibili su Bet365 secondo la verifica effettuata).")
+    out_of_schema = [r for r in player_rows if not bet365_line_allowed(r, STATS[market_label])]
+    player_rows = [r for r in player_rows if bet365_line_allowed(r, STATS[market_label])]
+    player_rows, excluded_rows = auto_filter_suspicious_lines(player_rows)
+    if excluded_rows:
+        st.caption(f"Escluse automaticamente {len(excluded_rows)} linee con quote Over incoerenti.")
+        with st.expander("🔎 Linee escluse per quote incoerenti"):
+            st.dataframe(pd.DataFrame(excluded_rows)[["Linea", "Over", "Tipo"]], hide_index=True, width="stretch")
+    if out_of_schema:
+        with st.expander(f"📋 {len(out_of_schema)} soglie alternative fuori schema Bet365"):
+            st.dataframe(pd.DataFrame(out_of_schema)[["Giocatore", "Linea", "Over", "Tipo"]],
+                         hide_index=True, width="stretch")
+            st.caption("Le soglie non previste dallo schema alternativo sono escluse.")
+    if not player_rows:
+        st.warning("Nessuna linea rimasta dopo i controlli automatici.")
+        st.stop()
+    frame = pd.DataFrame(player_rows).sort_values("Linea")
+    st.dataframe(frame[["Linea", "Over"]],
+        hide_index=True, width="stretch",
+        column_config={"Linea": st.column_config.NumberColumn(format="%.1f"),
+                       "Over": st.column_config.NumberColumn(format="%.3f")})
+    st.download_button("⬇️ Scarica CSV quote", frame[["Giocatore", "Linea", "Over"]].to_csv(index=False).encode("utf-8-sig"),
+                       file_name="nba_stats_quote.csv", mime="text/csv")
+    with st.expander("🔎 Diagnostica mercati (nessuna richiesta OddsPapi aggiuntiva)"):
+        st.json(diag)
+        st.caption("Dati ricavati dalla risposta OddsPapi già caricata.")
+
+    st.divider()
+    st.subheader("📈 Statistiche NBA — ESPN")
+    st.caption("Storico delle partite tramite ESPN, senza API a pagamento e senza richieste OddsPapi aggiuntive.")
+    season = st.selectbox("Stagione NBA", ["2026-27", "2025-26", "2024-25"])
+    competition_mode = st.radio("Tipo di competizione", ["Regular season", "Playoff", "Regular season + Playoff"], horizontal=True)
+
+    if st.button("📊 Carica statistiche NBA del giocatore"):
+        st.session_state.stats_selection = (player_name, season, competition_mode)
+    if st.session_state.get("stats_selection") == (player_name, season, competition_mode):
+        diagnostic_stage = "Identificazione giocatore su ESPN"
+        try:
+            fixture = options[choice]
+            nba_player, matching_diagnostics = match_espn_player(player_name, fixture.get("participant1Name", ""), fixture.get("participant2Name", ""), int(season[:4]) + 1)
+            if not nba_player:
+                st.warning("Giocatore non identificato nelle rose ESPN. Controlla la diagnostica: indica quanti atleti sono stati effettivamente letti.")
+                with st.expander("🔎 Diagnostica abbinamento ESPN", expanded=True):
+                    st.json({"Giocatore cercato": player_name, "Nome normalizzato": normalized_name(player_name), **matching_diagnostics})
+            else:
+                diagnostic_stage = "Recupero storico partite da ESPN"
+                log = selected_game_log(nba_player["id"], season, competition_mode, nba_player.get("team_id"))
+                uncertain_games = espn_classified_game_log(nba_player["id"], season, nba_player.get("team_id")).attrs.get("unclassified", 0)
+                if uncertain_games:
+                    st.warning(f"ESPN non permette di identificare la competizione di {uncertain_games} partite. Queste partite sono escluse dall’analisi per evitare statistiche errate.")
+                diagnostic_stage = "Elaborazione e visualizzazione statistiche"
+                if log.empty:
+                    st.info(f"Nessuna partita disponibile in modalità {competition_mode} per questo giocatore e questa stagione.")
+                else:
+                    log = prepare_game_log(log, nba_player.get("team_id"), season)
+                    stat = STATS[market_label]
+                    st.write(f"**{nba_player['full_name']} — {season} — {competition_mode} — {len(log)} partite**")
+                    if competition_mode != "Regular season":
+                        st.caption("Nei playoff il campione può essere ridotto. Le percentuali sono calcolate solo sulle partite effettivamente disponibili.")
+                    line = st.selectbox("Linea da analizzare", sorted(frame["Linea"].unique()), index=0)
+                    # The previous season is loaded only when the user requests the analysis.
+                    previous_season = f"{int(season[:4])-1}-{str(int(season[:4]))[-2:]}"
+                    previous_log = selected_game_log(nba_player["id"], previous_season, competition_mode, nba_player.get("team_id"))
+                    if not previous_log.empty:
+                        previous_log = prepare_game_log(previous_log, nba_player.get("team_id"), previous_season, require_dates=False)
+                    missing_dates = int(log["GAME_DATE"].isna().sum())
+                    periods = []
+                    if missing_dates == 0:
+                        periods.extend([("Ultime 5", log.head(5)), ("Ultime 10", log.head(10)),
+                                        ("Ultime 20", log.head(20))])
+                    else:
+                        st.warning(f"ESPN non fornisce una data verificabile per {missing_dates} partite su {len(log)}. "
+                                   "Le analisi ultime 5/10/20 sono sospese per evitare risultati inesatti; "
+                                   "le statistiche dell'intera stagione restano disponibili.")
+                    periods.extend([(f"{competition_mode} {season}", log),
+                                    (f"{competition_mode} {previous_season}", previous_log)])
+                    st.caption(f"Linea {line:g} · Over: risultato > {line:g}")
+                    for period_title, period_log in periods:
+                        values = period_log[stat].dropna() if not period_log.empty else pd.Series(dtype=float)
+                        count = len(values)
+                        over = int((values > line).sum())
+                        with st.container(border=True):
+                            first, second = st.columns([2, 1])
+                            with first:
+                                st.write(f"**{period_title}** · {count} partite")
+                                if count:
+                                    st.markdown(
+                                        f'<span style="display:inline-block;background:#dcfce7;color:#166534;padding:5px 12px;border-radius:20px;margin-right:8px;font-weight:600">'
+                                        f'↑ {over/count:.0%} Over ({over}/{count})</span>',
+                                        unsafe_allow_html=True,
+                                    )
+                                else:
+                                    st.caption("Nessuna partita disponibile")
+                            with second:
+                                if count:
+                                    st.metric(f"Media {stat}", f"{values.mean():.1f}",
+                                              f"{values.mean()-line:+.1f} rispetto alla linea")
+                    st.subheader(f"Dettaglio partite — {season} · {competition_mode}")
+                    detail_columns = ["GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"]
+                    if competition_mode == "Regular season + Playoff":
+                        detail_columns.insert(1, "SEASON_TYPE")
+                    visible = log[detail_columns].copy()
+                    if "SEASON_TYPE" in visible:
+                        visible["SEASON_TYPE"] = visible["SEASON_TYPE"].map({2: "Regular season", 3: "Playoff"})
+                    visible["GAME_DATE"] = visible["GAME_DATE"].dt.strftime("%d/%m/%Y")
+                    st.dataframe(visible, hide_index=True, width="stretch")
+                    with st.expander("📊 Riepilogo comparativo"):
+                        st.dataframe(pd.DataFrame([analysis_row(title, games, stat, line)
+                                                   for title, games in periods]), hide_index=True, width="stretch")
+
+        except Exception as exc:
+            # Never display or log raw exception text: request exceptions can contain URLs.
+            # Only publish the stage, exception class, and numeric HTTP status if present.
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if not isinstance(status, int):
+                status = None
+            error_type = type(exc).__name__
+            # Show the exact failing source line, without exposing request URLs or secrets.
+            frames_trace = traceback.extract_tb(exc.__traceback__)
+            own_frames = [f for f in frames_trace if f.filename.endswith("app.py") or "app_nba_stats" in f.filename]
+            failure = own_frames[-1] if own_frames else (frames_trace[-1] if frames_trace else None)
+            failure_location = f"Riga {failure.lineno} · funzione {failure.name}" if failure else "Non disponibile"
+            logger.error("NBA diagnostics: stage=%s type=%s http_status=%s location=%s", diagnostic_stage, error_type, status, failure_location)
+            st.error("Impossibile completare l'analisi ESPN. Le quote OddsPapi non sono coinvolte.")
+            st.caption(f"Punto del problema: **{failure_location}**")
+            if isinstance(exc, TypeError):
+                st.warning(f"Dettaglio TypeError: {str(exc)[:250]}")
+            if isinstance(exc, ValueError):
+                # Only locally constructed validation errors, never raw request URLs.
+                st.warning(f"Dettaglio verifica dati: {str(exc)[:350]}")
+            with st.expander("🔎 Diagnostica connessione NBA (nessuna richiesta aggiuntiva)", expanded=True):
+                st.json({"Fase": diagnostic_stage, "Tipo errore": error_type,
+                         "Stato HTTP": status if status is not None else "Non disponibile",
+                         "Giocatore": player_name, "Stagione": season,
+                         "Fonte": "ESPN (gratuita)", "Punto errore": failure_location})
+                st.caption("Questi dettagli sono ricavati dall'errore già avvenuto: non viene eseguito alcun nuovo test di rete. Non condividere eventuali credenziali presenti in altri log.")
+
+    st.caption("Quote: cache 24 ore · Calendario: 24 ore · Catalogo: 7 giorni · Statistiche ESPN: cache 6 ore. La cache può svuotarsi ai riavvii.")
+
+
+def get_saved_analysis(selected_date, season, min_games):
+    saved = st.session_state.get("finder_results")
+    if saved and (saved.get("date") != str(selected_date) or saved.get("season") != season or saved.get("model_version") != FINDER_MODEL_VERSION or saved.get("min_games") != int(min_games)):
+        return None
+    return saved
+
+
+def start_scan(fixtures, selected_date, season, min_games):
+    st.session_state.pop("finder_results", None)
+    progress = st.progress(0, text="Preparazione analisi...")
+    try:
+        catalog = get_markets()
+        # Pass broad bounds so the full unfiltered archive is preserved.
+        results, issues, odds_count, player_count, raw_audit, filter_audit = finder_scan(
+            fixtures, catalog, season, int(min_games), 1.01, 20.0, -100,
+            lambda p, t: progress.progress(min(1.0, max(0.0, p)), text=t))
+        st.session_state.finder_results = {
+            "date": str(selected_date), "season": season, "model_version": FINDER_MODEL_VERSION,
+            "results": results, "issues": issues, "odds_count": odds_count,
+            "player_count": player_count, "raw_audit": raw_audit, "filter_audit": filter_audit,
+            "min_games": int(min_games)}
+    except Exception as exc:
+        # Avoid printing raw requests errors that might contain an API key.
+        st.error(f"Analisi non completata ({type(exc).__name__}). Riprova.")
+    finally:
+        progress.empty()
+
+
+def get_filtered_frame(saved, odd_min, odd_max, market, minimum_probability):
+    df = pd.DataFrame(saved["results"])
+    if df.empty:
+        return df
+    q = pd.to_numeric(df["Quota"], errors="coerce")
+    p = pd.to_numeric(df["Prob. stimata %"], errors="coerce")
+    mask = q.between(odd_min, odd_max) & p.ge(minimum_probability)
+    if market != "Tutti":
+        mask &= df["Mercato"].eq(market)
+    return df.loc[mask].sort_values(["Prob. stimata %", "Partite"], ascending=False)
+
+
+def show_pick(saved, odds_min, odds_max):
+    df = pd.DataFrame(saved["results"])
+    ranked = rank_single_candidates(df, odds_min, odds_max)
+    shortlist = ranked[ranked["Esito screening"] == "Candidata da verificare"] if not ranked.empty else ranked
+    if shortlist.empty:
+        st.info("Nessuna singola supera tutti i criteri. Non è necessario giocare ogni giorno.")
+        return
+    pick = shortlist.iloc[0]
+    with st.container(border=True):
+        st.caption("PRIMA CANDIDATA DA VERIFICARE · NON È UNA RACCOMANDAZIONE AUTOMATICA")
+        st.subheader(f"{pick['Giocatore']} · {pick['Scelta']} {pick['Linea']:g} {pick['Mercato']}")
+        st.caption(str(pick["Partita"]))
+        a,b,c,d=st.columns(4)
+        a.metric("Quota feed", f"{pick['Quota']:.2f}")
+        b.metric("Prob. modello*", f"{pick['Prob. stimata %']:.1f}%")
+        c.metric("Pareggio quota", f"{pick['Prob. pareggio %']:.1f}%")
+        d.metric("Ultime 20", str(pick["Ultime 20"]))
+        st.caption("*Stima euristica non calibrata. Verifica squadra, disponibilità, minutaggio e quota reale.")
+    if len(shortlist)>1:
+        st.caption("Altre candidate che superano lo screening")
+        columns=[x for x in ["Giocatore","Mercato","Linea","Quota","Prob. stimata %","Ultime 20","Partita"] if x in shortlist]
+        st.dataframe(shortlist.iloc[1:6][columns],hide_index=True,use_container_width=True)
+
+
+def show_history():
+    st.subheader("Storico delle giocate")
+    st.caption("Registro locale alla sessione. Scarica il CSV per conservare i dati: Streamlit non garantisce memoria permanente tra riavvii.")
+    if "bets_history" not in st.session_state:
+        st.session_state.bets_history = [
+            {"Data":"2026-10-21","Giocatore":"Tre Jones","Mercato":"PTS","Linea":9.5,"Quota":1.83,"Puntata":10.0,"Esito":"Vinta"},
+            {"Data":"2026-10-22","Giocatore":"Jaylen Brown","Mercato":"PTS","Linea":19.5,"Quota":1.80,"Puntata":10.0,"Esito":"In attesa"}]
+    with st.expander("Aggiungi una giocata"):
+        with st.form("new_bet",clear_on_submit=True):
+            a,b=st.columns(2)
+            date=a.date_input("Data giocata",value=datetime.now(ROME_TZ).date())
+            player=b.text_input("Giocatore")
+            market=st.selectbox("Mercato",["PTS","REB","AST"])
+            a,b,c=st.columns(3)
+            line=a.number_input("Linea",min_value=0.5,step=1.0,value=9.5)
+            odd=b.number_input("Quota",min_value=1.01,step=0.01,value=1.80)
+            stake=c.number_input("Puntata (€)",min_value=0.01,step=1.0,value=10.0)
+            outcome=st.selectbox("Esito",["In attesa","Vinta","Persa","Annullata"])
+            if st.form_submit_button("Salva in questa sessione") and player.strip():
+                st.session_state.bets_history.append({"Data":str(date),"Giocatore":player.strip(),"Mercato":market,"Linea":line,"Quota":odd,"Puntata":stake,"Esito":outcome})
+                st.rerun()
+    with st.expander("Importa registro CSV"):
+        upload=st.file_uploader("CSV esportato da NBA STATS 3.0",type="csv",key="history_import")
+        if upload and st.button("Importa registro"):
+            try:
+                incoming=pd.read_csv(upload)
+                required={"Data","Giocatore","Mercato","Linea","Quota","Puntata","Esito"}
+                if not required.issubset(incoming.columns):
+                    st.error("Il CSV non contiene tutte le colonne richieste.")
+                else:
+                    st.session_state.bets_history=incoming[list(required)].to_dict("records")
+                    st.rerun()
+            except (ValueError,UnicodeDecodeError,pd.errors.ParserError):
+                st.error("Impossibile leggere il CSV.")
+    bets=pd.DataFrame(st.session_state.bets_history)
+    bets["Quota"]=pd.to_numeric(bets["Quota"],errors="coerce")
+    bets["Puntata"]=pd.to_numeric(bets["Puntata"],errors="coerce")
+    bets["Profitto €"]=bets.apply(lambda r: round(r["Puntata"]*(r["Quota"]-1),2) if r["Esito"]=="Vinta" else (-r["Puntata"] if r["Esito"]=="Persa" else 0.0),axis=1)
+    settled=bets[bets["Esito"].isin(["Vinta","Persa"])]
+    a,b,c=st.columns(3)
+    a.metric("Chiuse",len(settled))
+    b.metric("Bilancio realizzato",f"{settled['Profitto €'].sum():+.2f} €")
+    c.metric("ROI chiuse",f"{100*settled['Profitto €'].sum()/settled['Puntata'].sum():+.1f}%" if settled['Puntata'].sum() else "—")
+    st.dataframe(bets,hide_index=True,use_container_width=True)
+    st.download_button("Scarica registro CSV",csv_excel_friendly(bets),file_name="nba_stats_registro.csv",mime="text/csv")
+    st.caption("Le due giocate iniziali sono inserite dal registro discusso in chat; gli esiti non sono verificati automaticamente dal sito.")
+
+
+st.title("🏀 NBA STATS 3.0")
+st.caption("Value Finder · OddsPapi (quote Bet365) + ESPN · Interfaccia essenziale")
 if not API_KEY:
     st.error("Configura ODDSPAPI_API_KEY nei Secrets di Streamlit.")
     st.stop()
 
-selected_date = st.date_input("Data delle partite (ora italiana)", value=datetime.now(ROME_TZ).date())
+with st.sidebar:
+    st.header("Impostazioni")
+    selected_date=st.date_input("Data NBA (ora italiana)",value=datetime.now(ROME_TZ).date())
+    season=st.selectbox("Stagione",["2026-27","2025-26","2024-25"])
+    st.divider()
+    st.caption("Filtri della classifica e della singola")
+    odds_min=st.number_input("Quota minima",min_value=1.01,max_value=20.0,value=1.60,step=0.05)
+    odds_max=st.number_input("Quota massima",min_value=1.01,max_value=100.0,value=2.00,step=0.05)
+    market=st.selectbox("Mercato",["Tutti","PTS","REB","AST"])
+    minimum_probability=st.slider("Probabilità minima mostrata (%)",0,100,0,1)
+    min_games=st.number_input("Partite minime per la stima",min_value=10,max_value=60,value=15,step=5)
+    st.caption("I filtri non cancellano le quote del CSV completo.")
+    st.divider()
+    st.caption(f"Modello {FINDER_MODEL_VERSION} · Stime non calibrate")
+
+if odds_min>odds_max:
+    st.error("La quota minima non può superare quella massima.")
+    st.stop()
+
 try:
-    fixtures = [f for f in get_fixtures(selected_date.isoformat()) if not fixture_is_completed(f)]
-except (RuntimeError, ValueError) as exc:
-    st.error(f"Calendario non disponibile: {exc}")
-    st.stop()
-if not fixtures:
-    st.info("Nessuna partita NBA da mostrare per questa data: le partite terminate vengono escluse.")
-    st.stop()
-options = {f"{f.get('participant1Name', '?')} – {f.get('participant2Name', '?')} | {fixture_start_rome(f).strftime('%d/%m/%Y %H:%M')} (Italia)": f for f in fixtures}
-choice = st.selectbox("🏟️ Partita NBA", list(options))
-fixture_id = str(options[choice]["fixtureId"])
-st.caption(f"Partite NBA trovate: {len(fixtures)} · Date e orari in Europe/Rome (ora italiana)")
-section = st.radio("Sezione", ["📊 Analisi singola partita", "🔎 NBA Value Finder"], horizontal=True)
-if section == "🔎 NBA Value Finder":
-    if "odds_refresh_versions" not in st.session_state:
-        st.session_state.odds_refresh_versions = {}
-    render_value_finder(fixtures, selected_date)
-    st.stop()
+    fixtures=[f for f in get_fixtures(selected_date.isoformat()) if not fixture_is_completed(f)]
+except (RuntimeError,ValueError) as exc:
+    fixtures=[]
+    st.warning("Calendario non disponibile. Lo storico resta accessibile.")
 
-# Conserva in sessione le risposte per tutte le partite già consultate.
-# Cambiare partita o mercato non effettua nuove richieste a OddsPapi.
-if "odds_by_fixture" not in st.session_state:
-    st.session_state.odds_by_fixture = {}
-if "odds_refresh_versions" not in st.session_state:
-    st.session_state.odds_refresh_versions = {}
+page=st.radio("Navigazione",["🏠 Oggi","🏆 Classifica","📈 Giocatori","📚 Storico"],horizontal=True,label_visibility="collapsed")
+st.divider()
+saved=get_saved_analysis(selected_date,season,min_games)
 
-already_loaded = fixture_id in st.session_state.odds_by_fixture
-button_label = "🔄 Aggiorna quote" if already_loaded else "📥 Carica quote"
-refresh_clicked = st.button(button_label, type="primary")
-if not already_loaded and not refresh_clicked:
-    st.info("Premi **Carica quote** per questa partita. Se torni su una partita già caricata, le quote ricompariranno automaticamente senza nuove chiamate API.")
-    st.stop()
-
-market_label = st.selectbox("📊 Mercato giocatore", list(MARKETS))
-try:
-    catalog = get_markets()
-except (RuntimeError, ValueError) as exc:
-    st.error(f"Catalogo mercati non disponibile: {exc}")
-    st.stop()
-
-if refresh_clicked:
-    # Solo un clic esplicito genera una nuova versione della richiesta API.
-    versions = st.session_state.odds_refresh_versions
-    versions[fixture_id] = versions.get(fixture_id, 0) + 1
-    try:
-        incoming = get_odds(fixture_id, versions[fixture_id])
-        # Una risposta valida per almeno uno dei tre mercati viene salvata.
-        has_any_market = any(parse_odds(incoming, catalog, m)[0] for m in MARKETS)
-        if has_any_market:
-            st.session_state.odds_by_fixture[fixture_id] = incoming
-            st.success("Quote caricate e memorizzate per questa partita.")
-        elif already_loaded:
-            st.warning("Il nuovo aggiornamento non contiene quote alternative utilizzabili. Mantengo le quote precedenti della partita.")
+if page=="📚 Storico":
+    show_history()
+elif page=="📈 Giocatori":
+    st.subheader("Analisi dettagliata giocatore")
+    if not fixtures:
+        st.info("Nessuna partita futura disponibile nella data selezionata.")
+    else:
+        show_legacy_player(fixtures,selected_date)
+else:
+    if page=="🏠 Oggi":
+        st.subheader("La singola del giorno")
+        st.caption("Una candidata principale, soltanto se supera lo screening statistico.")
+    else:
+        st.subheader("Classifica e CSV")
+        st.caption("Tutte le linee analizzate in un'unica tabella filtrabile.")
+    if fixtures:
+        st.caption(f"{len(fixtures)} partite da analizzare · {selected_date.strftime('%d/%m/%Y')} (Italia)")
+    else:
+        st.info("Nessuna partita futura disponibile nella data selezionata.")
+    if fixtures and st.button("🔍 Analizza le partite",type="primary",key="scan_main"):
+        start_scan(fixtures,selected_date,season,min_games)
+        saved=get_saved_analysis(selected_date,season,min_games)
+    if saved:
+        df=pd.DataFrame(saved["results"])
+        a,b,c=st.columns(3)
+        a.metric("Linee totali",len(df))
+        b.metric("Giocatori",saved["player_count"])
+        c.metric("Segnalazioni",len(saved["issues"]))
+        if not df.empty:
+            if page=="🏠 Oggi":
+                show_pick(saved,odds_min,odds_max)
+                st.caption("La classifica completa e le esportazioni sono nella sezione Classifica.")
+            else:
+                filtered=get_filtered_frame(saved,odds_min,odds_max,market,minimum_probability)
+                st.caption(f"{len(filtered)} linee visibili su {len(df)} ricevute. Le linee non valutabili restano nel CSV completo.")
+                columns=[c for c in ["Giocatore","Partita","Mercato","Scelta","Linea","Quota","Prob. stimata %","Ultime 5","Ultime 10","Ultime 20","Partite","Value stimato %"] if c in filtered.columns]
+                st.dataframe(filtered[columns],hide_index=True,use_container_width=True)
+                a,b=st.columns(2)
+                a.download_button("⬇️ CSV filtrato",csv_excel_friendly(filtered),file_name="nba_stats_3_filtrato.csv",mime="text/csv",disabled=filtered.empty)
+                b.download_button("⬇️ CSV completo",csv_excel_friendly(df),file_name="nba_stats_3_tutte_le_linee.csv",mime="text/csv")
+                with st.expander("🎯 Screening avanzato delle singole"):
+                    ranked=rank_single_candidates(df,odds_min,odds_max)
+                    if not ranked.empty:
+                        st.dataframe(ranked,hide_index=True,use_container_width=True)
+                        st.download_button("⬇️ CSV screening",csv_excel_friendly(ranked),file_name="nba_stats_3_screening.csv",mime="text/csv")
+                    else:
+                        st.info("Nessuna candidata valutabile nella fascia quota.")
+                with st.expander("🔬 Diagnostica feed ed ESPN"):
+                    if saved.get("issues"):
+                        st.write("\n".join(f"- {issue}" for issue in saved["issues"][:100]))
+                    if saved.get("filter_audit"):
+                        st.dataframe(pd.DataFrame(saved["filter_audit"]),hide_index=True,use_container_width=True)
+                    if saved.get("raw_audit"):
+                        audit=pd.DataFrame(saved["raw_audit"])
+                        st.download_button("Scarica diagnostica",audit.to_csv(index=False).encode("utf-8-sig"),file_name="nba_stats_diagnostica.csv",mime="text/csv")
         else:
-            st.warning("La risposta OddsPapi non contiene quote alternative utilizzabili. Puoi riprovare più tardi.")
-    except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
-        if already_loaded:
-            st.warning(f"Aggiornamento non riuscito ({exc}). Mantengo le quote precedenti.")
-        else:
-            st.error(f"Caricamento non riuscito: {exc}")
-
-odds = st.session_state.odds_by_fixture.get(fixture_id)
-if odds is None:
-    st.stop()
-if not refresh_clicked:
-    st.caption("Quote già caricate in questa sessione · Nessuna nuova chiamata API. Premi **Aggiorna quote** per richiederne di nuove.")
-try:
-    rows, diag = parse_odds(odds, catalog, market_label)
-except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
-    st.error(f"Impossibile interpretare le quote salvate: {exc}")
-    st.stop()
-if not rows:
-    st.warning("Nessuna quota disponibile nel feed per questo mercato.")
-    st.stop()
-player_name = st.selectbox("🏀 Giocatore", sorted({r["Giocatore"] for r in rows}))
-player_rows = [r for r in rows if r["Giocatore"] == player_name]
-st.subheader(f"{player_name} · {market_label}")
-st.caption("Solo mercati alternativi Over (+): 20+ equivale a Over 19,5. Mercati principali e Under esclusi.")
-st.caption("Controllo automatico attivo: linea 0,5 sempre esclusa; se una soglia inferiore ha una quota Over maggiore della successiva, viene esclusa. La disponibilità su Bet365 non è garantita.")
-removed_half = [r for r in player_rows if abs(float(r["Linea"]) - 0.5) < 1e-6]
-player_rows = [r for r in player_rows if abs(float(r["Linea"]) - 0.5) >= 1e-6]
-if removed_half:
-    st.caption(f"Escluse {len(removed_half)} linee 0,5 (non disponibili su Bet365 secondo la verifica effettuata).")
-out_of_schema = [r for r in player_rows if not bet365_line_allowed(r, STATS[market_label])]
-player_rows = [r for r in player_rows if bet365_line_allowed(r, STATS[market_label])]
-player_rows, excluded_rows = auto_filter_suspicious_lines(player_rows)
-if excluded_rows:
-    st.caption(f"Escluse automaticamente {len(excluded_rows)} linee con quote Over incoerenti.")
-    with st.expander("🔎 Linee escluse per quote incoerenti"):
-        st.dataframe(pd.DataFrame(excluded_rows)[["Linea", "Over", "Tipo"]], hide_index=True, width="stretch")
-if out_of_schema:
-    with st.expander(f"📋 {len(out_of_schema)} soglie alternative fuori schema Bet365"):
-        st.dataframe(pd.DataFrame(out_of_schema)[["Giocatore", "Linea", "Over", "Tipo"]],
-                     hide_index=True, width="stretch")
-        st.caption("Le soglie non previste dallo schema alternativo sono escluse.")
-if not player_rows:
-    st.warning("Nessuna linea rimasta dopo i controlli automatici.")
-    st.stop()
-frame = pd.DataFrame(player_rows).sort_values("Linea")
-st.dataframe(frame[["Linea", "Over"]],
-    hide_index=True, width="stretch",
-    column_config={"Linea": st.column_config.NumberColumn(format="%.1f"),
-                   "Over": st.column_config.NumberColumn(format="%.3f")})
-st.download_button("⬇️ Scarica CSV quote", frame[["Giocatore", "Linea", "Over"]].to_csv(index=False).encode("utf-8-sig"),
-                   file_name="nba_stats_quote.csv", mime="text/csv")
-with st.expander("🔎 Diagnostica mercati (nessuna richiesta OddsPapi aggiuntiva)"):
-    st.json(diag)
-    st.caption("Dati ricavati dalla risposta OddsPapi già caricata.")
+            st.warning("Nessuna linea disponibile dalla scansione.")
+    elif fixtures:
+        st.info("Premi Analizza le partite. Le quote vengono riutilizzate nella sessione quando possibile.")
 
 st.divider()
-st.subheader("📈 Statistiche NBA — ESPN")
-st.caption("Storico delle partite tramite ESPN, senza API a pagamento e senza richieste OddsPapi aggiuntive.")
-season = st.selectbox("Stagione NBA", ["2026-27", "2025-26", "2024-25"])
-competition_mode = st.radio("Tipo di competizione", ["Regular season", "Playoff", "Regular season + Playoff"], horizontal=True)
-
-if st.button("📊 Carica statistiche NBA del giocatore"):
-    st.session_state.stats_selection = (player_name, season, competition_mode)
-if st.session_state.get("stats_selection") == (player_name, season, competition_mode):
-    diagnostic_stage = "Identificazione giocatore su ESPN"
-    try:
-        fixture = options[choice]
-        nba_player, matching_diagnostics = match_espn_player(player_name, fixture.get("participant1Name", ""), fixture.get("participant2Name", ""), int(season[:4]) + 1)
-        if not nba_player:
-            st.warning("Giocatore non identificato nelle rose ESPN. Controlla la diagnostica: indica quanti atleti sono stati effettivamente letti.")
-            with st.expander("🔎 Diagnostica abbinamento ESPN", expanded=True):
-                st.json({"Giocatore cercato": player_name, "Nome normalizzato": normalized_name(player_name), **matching_diagnostics})
-        else:
-            diagnostic_stage = "Recupero storico partite da ESPN"
-            log = selected_game_log(nba_player["id"], season, competition_mode, nba_player.get("team_id"))
-            uncertain_games = espn_classified_game_log(nba_player["id"], season, nba_player.get("team_id")).attrs.get("unclassified", 0)
-            if uncertain_games:
-                st.warning(f"ESPN non permette di identificare la competizione di {uncertain_games} partite. Queste partite sono escluse dall’analisi per evitare statistiche errate.")
-            diagnostic_stage = "Elaborazione e visualizzazione statistiche"
-            if log.empty:
-                st.info(f"Nessuna partita disponibile in modalità {competition_mode} per questo giocatore e questa stagione.")
-            else:
-                log = prepare_game_log(log, nba_player.get("team_id"), season)
-                stat = STATS[market_label]
-                st.write(f"**{nba_player['full_name']} — {season} — {competition_mode} — {len(log)} partite**")
-                if competition_mode != "Regular season":
-                    st.caption("Nei playoff il campione può essere ridotto. Le percentuali sono calcolate solo sulle partite effettivamente disponibili.")
-                line = st.selectbox("Linea da analizzare", sorted(frame["Linea"].unique()), index=0)
-                # The previous season is loaded only when the user requests the analysis.
-                previous_season = f"{int(season[:4])-1}-{str(int(season[:4]))[-2:]}"
-                previous_log = selected_game_log(nba_player["id"], previous_season, competition_mode, nba_player.get("team_id"))
-                if not previous_log.empty:
-                    previous_log = prepare_game_log(previous_log, nba_player.get("team_id"), previous_season, require_dates=False)
-                missing_dates = int(log["GAME_DATE"].isna().sum())
-                periods = []
-                if missing_dates == 0:
-                    periods.extend([("Ultime 5", log.head(5)), ("Ultime 10", log.head(10)),
-                                    ("Ultime 20", log.head(20))])
-                else:
-                    st.warning(f"ESPN non fornisce una data verificabile per {missing_dates} partite su {len(log)}. "
-                               "Le analisi ultime 5/10/20 sono sospese per evitare risultati inesatti; "
-                               "le statistiche dell'intera stagione restano disponibili.")
-                periods.extend([(f"{competition_mode} {season}", log),
-                                (f"{competition_mode} {previous_season}", previous_log)])
-                st.caption(f"Linea {line:g} · Over: risultato > {line:g}")
-                for period_title, period_log in periods:
-                    values = period_log[stat].dropna() if not period_log.empty else pd.Series(dtype=float)
-                    count = len(values)
-                    over = int((values > line).sum())
-                    with st.container(border=True):
-                        first, second = st.columns([2, 1])
-                        with first:
-                            st.write(f"**{period_title}** · {count} partite")
-                            if count:
-                                st.markdown(
-                                    f'<span style="display:inline-block;background:#dcfce7;color:#166534;padding:5px 12px;border-radius:20px;margin-right:8px;font-weight:600">'
-                                    f'↑ {over/count:.0%} Over ({over}/{count})</span>',
-                                    unsafe_allow_html=True,
-                                )
-                            else:
-                                st.caption("Nessuna partita disponibile")
-                        with second:
-                            if count:
-                                st.metric(f"Media {stat}", f"{values.mean():.1f}",
-                                          f"{values.mean()-line:+.1f} rispetto alla linea")
-                st.subheader(f"Dettaglio partite — {season} · {competition_mode}")
-                detail_columns = ["GAME_DATE", "MATCHUP", "MIN", "PTS", "REB", "AST"]
-                if competition_mode == "Regular season + Playoff":
-                    detail_columns.insert(1, "SEASON_TYPE")
-                visible = log[detail_columns].copy()
-                if "SEASON_TYPE" in visible:
-                    visible["SEASON_TYPE"] = visible["SEASON_TYPE"].map({2: "Regular season", 3: "Playoff"})
-                visible["GAME_DATE"] = visible["GAME_DATE"].dt.strftime("%d/%m/%Y")
-                st.dataframe(visible, hide_index=True, width="stretch")
-                with st.expander("📊 Riepilogo comparativo"):
-                    st.dataframe(pd.DataFrame([analysis_row(title, games, stat, line)
-                                               for title, games in periods]), hide_index=True, width="stretch")
-
-    except Exception as exc:
-        # Never display or log raw exception text: request exceptions can contain URLs.
-        # Only publish the stage, exception class, and numeric HTTP status if present.
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-        if not isinstance(status, int):
-            status = None
-        error_type = type(exc).__name__
-        # Show the exact failing source line, without exposing request URLs or secrets.
-        frames_trace = traceback.extract_tb(exc.__traceback__)
-        own_frames = [f for f in frames_trace if f.filename.endswith("app.py") or "app_nba_stats" in f.filename]
-        failure = own_frames[-1] if own_frames else (frames_trace[-1] if frames_trace else None)
-        failure_location = f"Riga {failure.lineno} · funzione {failure.name}" if failure else "Non disponibile"
-        logger.error("NBA diagnostics: stage=%s type=%s http_status=%s location=%s", diagnostic_stage, error_type, status, failure_location)
-        st.error("Impossibile completare l'analisi ESPN. Le quote OddsPapi non sono coinvolte.")
-        st.caption(f"Punto del problema: **{failure_location}**")
-        if isinstance(exc, TypeError):
-            st.warning(f"Dettaglio TypeError: {str(exc)[:250]}")
-        if isinstance(exc, ValueError):
-            # Only locally constructed validation errors, never raw request URLs.
-            st.warning(f"Dettaglio verifica dati: {str(exc)[:350]}")
-        with st.expander("🔎 Diagnostica connessione NBA (nessuna richiesta aggiuntiva)", expanded=True):
-            st.json({"Fase": diagnostic_stage, "Tipo errore": error_type,
-                     "Stato HTTP": status if status is not None else "Non disponibile",
-                     "Giocatore": player_name, "Stagione": season,
-                     "Fonte": "ESPN (gratuita)", "Punto errore": failure_location})
-            st.caption("Questi dettagli sono ricavati dall'errore già avvenuto: non viene eseguito alcun nuovo test di rete. Non condividere eventuali credenziali presenti in altri log.")
-
-st.caption("Quote: cache 24 ore · Calendario: 24 ore · Catalogo: 7 giorni · Statistiche ESPN: cache 6 ore. La cache può svuotarsi ai riavvii.")
+st.caption("Quote e dati possono cambiare. Nessuna selezione è garantita. Verificare sempre disponibilità e quote effettive.")
