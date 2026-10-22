@@ -9,7 +9,7 @@ import altair as alt
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="NBA STATS 3.4", page_icon="🏀", layout="wide")
+st.set_page_config(page_title="NBA STATS 3.5", page_icon="🏀", layout="wide")
 logger = logging.getLogger("nba_stats_diagnostics")
 BASE = "https://api.oddspapi.io/v4"
 ROME_TZ = ZoneInfo("Europe/Rome")
@@ -1247,8 +1247,17 @@ def show_pick(saved, odds_min, odds_max, market="Tutti", minimum_probability=0):
         st.caption(str(pick["Partita"]))
         a,b,c=st.columns(3)
         a.metric("Quota feed", f"{pick['Quota']:.2f}")
-        b.metric("Prob. modello*", f"{pick['Prob. stimata %']:.1f}%")
+        b.metric("Stima statistica*", f"{pick['Prob. stimata %']:.1f}%")
         c.metric("Ultime 20", str(pick["Ultime 20"]))
+        hits = _ratio_hits(pick.get("Ultime 20", ""))
+        n = int(pick.get("Partite", 0) or 0)
+        current_n = int(pick.get("Stagione attuale (n)", 0) or 0)
+        if hits:
+            st.caption(f"Frequenza osservata ultime 20: {hits[0]}/{hits[1]} ({100*hits[0]/hits[1]:.1f}%).")
+        st.caption(f"Base statistica: {n} partite complessive, di cui {current_n} nella stagione attuale. Affidabilità predittiva: NON ancora validata.")
+        with st.expander("Come leggere la stima statistica"):
+            st.write("La stima combina l'80% della frequenza Over complessiva e il 20% della frequenza delle ultime 20 partite, entrambe regolarizzate con Jeffreys Beta(0,5; 0,5). Le ultime 20 sono già comprese nello storico complessivo.")
+            st.write("Non è una probabilità reale verificata: non integra automaticamente avversario, infortuni, variazioni di ruolo o minutaggio previsto. Un campione più grande non garantisce una previsione accurata.")
         st.caption("*Stima euristica non calibrata. Verifica squadra, disponibilità, minutaggio e quota reale.")
     if len(shortlist)>1:
         st.caption("Altre candidate che superano lo screening")
@@ -1490,6 +1499,40 @@ h3 { font-size: 1.28rem !important; }
     background: #14243b !important;
     box-shadow: 0 0 0 1px rgba(96,165,250,.15), 0 10px 32px rgba(0,0,0,.22) !important;
 }
+/* NBA STATS 3.5: override finale e SPECIFICO del campo data.
+   Evita che i selettori generici della sidebar prevalgano sul valore del calendario. */
+[data-testid="stSidebar"] [data-testid="stDateInput"] [data-baseweb="input"],
+[data-testid="stSidebar"] [data-testid="stDateInput"] [data-baseweb="input"] > div,
+[data-testid="stSidebar"] [data-testid="stDateInput"] input,
+[data-testid="stSidebar"] [data-testid="stDateInput"] input:focus,
+[data-testid="stSidebar"] [data-testid="stDateInput"] input:disabled {
+    background-color: #ffffff !important;
+    color: #14243b !important;
+    -webkit-text-fill-color: #14243b !important;
+    opacity: 1 !important;
+    caret-color: #14243b !important;
+}
+[data-testid="stSidebar"] [data-testid="stDateInput"] input::placeholder {
+    color: #475569 !important;
+    -webkit-text-fill-color: #475569 !important;
+    opacity: 1 !important;
+}
+[data-testid="stSidebar"] [data-testid="stDateInput"] button,
+[data-testid="stSidebar"] [data-testid="stDateInput"] button svg {
+    color: #14243b !important;
+    fill: #14243b !important;
+}
+/* Popover calendario BaseWeb: contrasto e selezione, anche fuori dalla sidebar. */
+[data-baseweb="calendar"] button:not([aria-selected="true"]),
+[data-baseweb="calendar"] button:not([aria-selected="true"]) span {
+    color: #14243b !important;
+    -webkit-text-fill-color: #14243b !important;
+}
+[data-baseweb="calendar"] [aria-selected="true"],
+[data-baseweb="calendar"] [aria-selected="true"] * {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1641,6 +1684,15 @@ else:
                 ]
                 summary = pd.DataFrame([analysis_row(title, data, stat, float(line)) for title, data in periods])
                 st.dataframe(summary, hide_index=True, use_container_width=True)
+                st.caption("Le percentuali Over della tabella sono frequenze osservate, non probabilità predittive validate.")
+                estimate = finder_estimate_probability(log, stat, float(line), "Over")
+                if estimate:
+                    st.metric("Stima statistica modello (non calibrata)", f"{100*estimate['estimate']:.1f}%")
+                    with st.expander("Come viene calcolata questa stima?"):
+                        st.write("80% frequenza Over complessiva + 20% frequenza ultime 20, con regolarizzazione Beta(0,5; 0,5). La stima non tiene automaticamente conto del prossimo avversario o del ruolo attuale.")
+                        st.write(f"Partite considerate: {estimate['n']}; ultime partite nella componente recente: {estimate['n_recent']}. Affidabilità predittiva: non ancora validata.")
+                else:
+                    st.caption("Stima modello non disponibile: servono almeno 15 partite valide e una linea Over a metà punto.")
                 a,b = st.columns(2)
                 a.metric(f"Partite {season}", len(current_log))
                 b.metric(f"Partite {previous_season}", len(previous_log))
