@@ -5,10 +5,11 @@ import re
 import logging
 import traceback
 import pandas as pd
+import altair as alt
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="NBA STATS 3.2", page_icon="🏀", layout="wide")
+st.set_page_config(page_title="NBA STATS 3.3", page_icon="🏀", layout="wide")
 logger = logging.getLogger("nba_stats_diagnostics")
 BASE = "https://api.oddspapi.io/v4"
 ROME_TZ = ZoneInfo("Europe/Rome")
@@ -1361,6 +1362,55 @@ h3 { font-size: 1.28rem !important; }
 }
 [data-testid="stSelectbox"] svg, [data-testid="stDateInput"] svg,
 [data-testid="stNumberInput"] svg { fill: #e2eaf7 !important; color: #e2eaf7 !important; }
+/* NBA STATS 3.3: campi e popup a sfondo chiaro con testo SCURO, senza combinazioni invisibili. */
+[data-testid="stSidebar"] [data-baseweb="input"],
+[data-testid="stSidebar"] [data-baseweb="input"] > div,
+[data-testid="stSidebar"] [data-baseweb="select"],
+[data-testid="stSidebar"] [data-baseweb="select"] > div,
+[data-testid="stSidebar"] input,
+[data-testid="stMain"] [data-baseweb="select"],
+[data-testid="stMain"] [data-baseweb="select"] > div,
+[data-testid="stMain"] [data-baseweb="input"],
+[data-testid="stMain"] [data-baseweb="input"] > div,
+[data-testid="stMain"] input {
+    background: #f8fafc !important; color: #12243b !important;
+    -webkit-text-fill-color: #12243b !important; border-color: #b7c6d8 !important;
+}
+[data-testid="stSidebar"] [data-baseweb="select"] *,
+[data-testid="stMain"] [data-baseweb="select"] *,
+[data-testid="stSidebar"] [data-baseweb="input"] input,
+[data-testid="stMain"] [data-baseweb="input"] input {
+    color: #12243b !important; -webkit-text-fill-color: #12243b !important;
+}
+[data-testid="stSidebar"] [data-baseweb="select"] svg,
+[data-testid="stMain"] [data-baseweb="select"] svg,
+[data-testid="stDateInput"] svg { fill: #334e70 !important; color: #334e70 !important; }
+[data-testid="stNumberInput"] button { background: #243e60 !important; color: #fff !important; }
+[data-testid="stNumberInput"] button svg { color: #fff !important; fill: #fff !important; }
+/* Calendario e menu a comparsa BaseWeb (renderizzati fuori dal contenitore Streamlit). */
+[data-baseweb="popover"], [data-baseweb="popover"] *,
+[data-baseweb="calendar"], [data-baseweb="calendar"] *,
+[data-baseweb="menu"], [data-baseweb="menu"] * {
+    color: #14243b !important; -webkit-text-fill-color: #14243b !important;
+}
+[data-baseweb="popover"], [data-baseweb="calendar"], [data-baseweb="menu"],
+[data-baseweb="popover"] [role="listbox"], [data-baseweb="calendar"] > div {
+    background: #f8fafc !important;
+}
+[data-baseweb="calendar"] button, [data-baseweb="calendar"] select {
+    color: #14243b !important; -webkit-text-fill-color: #14243b !important;
+}
+[data-baseweb="calendar"] [aria-selected="true"],
+[data-baseweb="calendar"] [aria-selected="true"] * {
+    background: #2563eb !important; color: #fff !important; -webkit-text-fill-color: #fff !important;
+}
+[data-baseweb="menu"] li:hover, [data-baseweb="menu"] [role="option"]:hover { background: #dbeafe !important; }
+[data-testid="stSidebar"] [data-testid="stExpander"] summary,
+[data-testid="stSidebar"] [data-testid="stExpander"] summary * {
+    background: #243c5b !important; color: #f8fafc !important; -webkit-text-fill-color: #f8fafc !important;
+}
+/* Migliore leggibilità del testo nelle tabelle Streamlit. */
+[data-testid="stDataFrame"] { background: #fff !important; }
 /* Slider: indicazioni sempre leggibili */
 [data-testid="stSlider"] [data-testid="stTickBar"] { color: #e2eaf7 !important; }
 /* Metriche e card */
@@ -1412,7 +1462,7 @@ if not API_KEY:
 with st.sidebar:
     st.markdown("### ⚙️ Impostazioni")
     selected_date = st.date_input("Data delle partite (Italia)", value=datetime.now(ROME_TZ).date())
-    st.caption("Storico ESPN automatico: stagione attuale + precedente, in ordine cronologico.")
+    st.caption("Storico ESPN automatico: stagione attuale + precedente, con ultime 5/10/20 combinate.")
     st.divider()
     st.markdown("**Filtri delle selezioni**")
     odds_min = st.number_input("Quota minima", min_value=1.01, max_value=20.0, value=1.60, step=0.05)
@@ -1436,7 +1486,7 @@ def current_nba_season(day):
 season = current_nba_season(selected_date)
 
 st.markdown("# 🏀 NBA STATS | PRO ANALYTICS")
-st.caption("VALUE FINDER 3.2  ·  OddsPapi Bet365 + ESPN  ·  Analisi NBA")
+st.caption("VALUE FINDER 3.3  ·  OddsPapi Bet365 + ESPN  ·  Analisi NBA")
 page = st.radio("Sezioni", ["🏠 Dashboard", "🎯 Value Finder", "📊 Player Stats"], horizontal=True, label_visibility="collapsed")
 
 # Recupero calendario condiviso; la scansione delle quote avviene SOLO al clic.
@@ -1529,16 +1579,46 @@ else:
             line = st.selectbox("Linea Over", choices) if choices else st.number_input("Linea Over", min_value=0.5, value=9.5, step=1.0)
             log = logs[player].copy().sort_values("GAME_DATE", ascending=False)
             if not log.empty:
-                periods = [("Ultime 5", log.head(5)), ("Ultime 10", log.head(10)), ("Ultime 20", log.head(20)), ("Due stagioni", log)]
-                summary = pd.DataFrame([analysis_row(title, data, stat, float(line)) for title,data in periods])
+                previous_season = f"{int(season[:4])-1}-{str(int(season[:4]))[-2:]}"
+                current_log = log[log["ANNO_STAGIONE"] == season]
+                previous_log = log[log["ANNO_STAGIONE"] == previous_season]
+                periods = [
+                    ("Ultime 5 (combinate)", log.head(5)),
+                    ("Ultime 10 (combinate)", log.head(10)),
+                    ("Ultime 20 (combinate)", log.head(20)),
+                    (f"Stagione {season}", current_log),
+                    (f"Stagione {previous_season}", previous_log),
+                ]
+                summary = pd.DataFrame([analysis_row(title, data, stat, float(line)) for title, data in periods])
                 st.dataframe(summary, hide_index=True, use_container_width=True)
                 a,b = st.columns(2)
-                a.metric("Partite stagione attuale", int((log["ANNO_STAGIONE"] == season).sum()))
-                b.metric("Partite stagione precedente", int((log["ANNO_STAGIONE"] != season).sum()))
-                chart = log.head(20).iloc[::-1].copy()
+                a.metric(f"Partite {season}", len(current_log))
+                b.metric(f"Partite {previous_season}", len(previous_log))
+                st.markdown("#### Ultime 20 partite · Over/Under")
+                chart = log.head(20).iloc[::-1].copy().reset_index(drop=True)
                 chart["Partita"] = chart["GAME_DATE"].dt.strftime("%d/%m")
-                chart["Linea Over"] = float(line)
-                st.line_chart(chart.set_index("Partita")[[stat, "Linea Over"]], use_container_width=True)
+                chart["Indice"] = range(1, len(chart) + 1)
+                chart["Esito"] = chart[stat].apply(lambda x: "OVER" if x > float(line) else "UNDER")
+                chart["Etichetta"] = chart[stat].map(lambda x: f"{x:g}")
+                chart["Stagione"] = chart["ANNO_STAGIONE"].astype(str)
+                base = alt.Chart(chart).encode(
+                    x=alt.X("Indice:O", title="Partite dalla meno recente alla più recente", axis=alt.Axis(labelAngle=0)),
+                    tooltip=[alt.Tooltip("Partita:N", title="Data"), alt.Tooltip("Stagione:N"),
+                             alt.Tooltip(f"{stat}:Q", title=stat), alt.Tooltip("Esito:N")],
+                )
+                bars = base.mark_bar(size=26, cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+                    y=alt.Y(f"{stat}:Q", title=stat, scale=alt.Scale(zero=True)),
+                    color=alt.Color("Esito:N", scale=alt.Scale(domain=["OVER", "UNDER"], range=["#19c99a", "#f06a79"]),
+                                    legend=alt.Legend(title="Risultato")),
+                )
+                labels = base.mark_text(dy=-10, color="#eaf2ff", fontSize=12, fontWeight="bold").encode(
+                    y=alt.Y(f"{stat}:Q"), text="Etichetta:N"
+                )
+                threshold = alt.Chart(pd.DataFrame({"Soglia": [float(line)]})).mark_rule(
+                    color="#f5b942", strokeDash=[6, 4], strokeWidth=2.5
+                ).encode(y="Soglia:Q")
+                st.altair_chart((bars + threshold + labels).properties(height=340), use_container_width=True)
+                st.caption("Verde: Over · Rosa: Under · Linea gialla tratteggiata: soglia selezionata. Ultime 20 combinate in ordine cronologico.")
                 with st.expander("Dettaglio delle partite ESPN"):
                     columns = [c for c in ["GAME_DATE", "ANNO_STAGIONE", "MATCHUP", "MIN", "PTS", "REB", "AST"] if c in log.columns]
                     st.dataframe(log[columns], hide_index=True, use_container_width=True)
