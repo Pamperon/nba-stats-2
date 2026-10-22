@@ -9,7 +9,7 @@ import altair as alt
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="NBA STATS 3.3", page_icon="🏀", layout="wide")
+st.set_page_config(page_title="NBA STATS 3.4", page_icon="🏀", layout="wide")
 logger = logging.getLogger("nba_stats_diagnostics")
 BASE = "https://api.oddspapi.io/v4"
 ROME_TZ = ZoneInfo("Europe/Rome")
@@ -612,7 +612,8 @@ def finder_player_index(end_year):
         for athlete in roster_athletes(roster):
             index.setdefault(normalized_name(athlete["displayName"]),
                              {"id": athlete["id"], "team_id": team_id,
-                              "full_name": athlete["displayName"]})
+                              "full_name": athlete["displayName"],
+                              "team_name": team.get("displayName") or team.get("name") or f"Squadra ESPN {team_id}"})
     return index
 
 
@@ -777,7 +778,9 @@ def finder_scan(fixtures, catalog, season, min_games, odds_min, odds_max,
             issues.append(f"{player_name}: {error}")
         for match_name, market_label, line, price, reason in props:
             stat = STATS[market_label]
-            row = {"Partita": match_name, "Giocatore": player_name, "Mercato": stat,
+            row = {"Partita": match_name, "Giocatore": player_name,
+                   "Squadra": athlete.get("team_name", "Squadra non identificata") if athlete else "Squadra non identificata",
+                   "Mercato": stat,
                    "Scelta": "Over", "Linea": line, "Quota": price,
                    "Prob. stimata %": None, "Prob. implicita %": round(100 / price, 1),
                    "Value stimato %": None, "Ultime 5": "—", "Ultime 10": "—",
@@ -1238,15 +1241,14 @@ def show_pick(saved, odds_min, odds_max, market="Tutti", minimum_probability=0):
         st.info("Nessuna singola supera tutti gli 8 criteri dello screening. Le altre selezioni restano consultabili nella Classifica.")
         return
     pick = shortlist.iloc[0]
-    with st.container(border=True):
+    with st.container(border=True, key="daily_pick_card"):
         st.caption("PRIMA CANDIDATA DA VERIFICARE · NON È UNA RACCOMANDAZIONE AUTOMATICA")
         st.subheader(f"{pick['Giocatore']} · {pick['Scelta']} {pick['Linea']:g} {pick['Mercato']}")
         st.caption(str(pick["Partita"]))
-        a,b,c,d=st.columns(4)
+        a,b,c=st.columns(3)
         a.metric("Quota feed", f"{pick['Quota']:.2f}")
         b.metric("Prob. modello*", f"{pick['Prob. stimata %']:.1f}%")
-        c.metric("Pareggio quota", f"{pick['Prob. pareggio %']:.1f}%")
-        d.metric("Ultime 20", str(pick["Ultime 20"]))
+        c.metric("Ultime 20", str(pick["Ultime 20"]))
         st.caption("*Stima euristica non calibrata. Verifica squadra, disponibilità, minutaggio e quota reale.")
     if len(shortlist)>1:
         st.caption("Altre candidate che superano lo screening")
@@ -1452,6 +1454,42 @@ h3 { font-size: 1.28rem !important; }
     .block-container { padding: 1rem .9rem 2.5rem !important; }
     h1 { font-size: 1.65rem !important; }
 }
+/* NBA STATS 3.4: calendario con testo leggibile, anche nei giorni non selezionati. */
+[data-baseweb="calendar"], [data-baseweb="calendar"] > div,
+[data-baseweb="calendar"] [role="grid"],
+[data-baseweb="calendar"] [role="gridcell"],
+[data-baseweb="calendar"] [role="columnheader"] {
+    background-color: #f8fafc !important; color: #14243b !important;
+    -webkit-text-fill-color: #14243b !important;
+}
+[data-baseweb="calendar"] button,
+[data-baseweb="calendar"] button span,
+[data-baseweb="calendar"] [role="gridcell"] *,
+[data-baseweb="calendar"] [role="columnheader"] * {
+    color: #14243b !important; -webkit-text-fill-color: #14243b !important;
+}
+[data-baseweb="calendar"] [aria-selected="true"],
+[data-baseweb="calendar"] [aria-selected="true"] *,
+[data-baseweb="calendar"] button[aria-selected="true"],
+[data-baseweb="calendar"] button[aria-selected="true"] * {
+    background: #2563eb !important; color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+}
+[data-baseweb="calendar"] [aria-disabled="true"],
+[data-baseweb="calendar"] [aria-disabled="true"] * { color: #77869b !important; -webkit-text-fill-color: #77869b !important; }
+/* Rimuove l'effetto bianco su bianco causato dai vecchi selettori generici. */
+[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] span,
+[data-testid="stSidebar"] [data-testid="stDateInput"] input,
+[data-testid="stMain"] [data-testid="stSelectbox"] [data-baseweb="select"] span {
+    color: #14243b !important; -webkit-text-fill-color: #14243b !important;
+}
+/* Evidenzia solo la card della singola del giorno, non tutte le tabelle. */
+.st-key-daily_pick_card, [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-daily_pick_card) {
+    border: 2px solid #60a5fa !important;
+    border-radius: 16px !important;
+    background: #14243b !important;
+    box-shadow: 0 0 0 1px rgba(96,165,250,.15), 0 10px 32px rgba(0,0,0,.22) !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1469,8 +1507,8 @@ with st.sidebar:
     odds_max = st.number_input("Quota massima", min_value=1.01, max_value=100.0, value=2.00, step=0.05)
     market = st.selectbox("Mercato", ["Tutti", "PTS", "REB", "AST"])
     minimum_probability = st.slider("Probabilità minima mostrata (%)", 0, 100, 0, 1)
-    with st.expander("Filtri avanzati"):
-        min_games = st.number_input("Partite minime per la stima", min_value=10, max_value=60, value=15, step=5)
+    # Soglia interna fissa: evita stime su campioni troppo piccoli senza appesantire la UI.
+    min_games = 15
     st.caption("I filtri non eliminano quote dal CSV completo.")
     st.caption(f"Modello {FINDER_MODEL_VERSION} · Stime non calibrate")
 
@@ -1486,7 +1524,7 @@ def current_nba_season(day):
 season = current_nba_season(selected_date)
 
 st.markdown("# 🏀 NBA STATS | PRO ANALYTICS")
-st.caption("VALUE FINDER 3.3  ·  OddsPapi Bet365 + ESPN  ·  Analisi NBA")
+st.caption("VALUE FINDER 3.4  ·  OddsPapi Bet365 + ESPN  ·  Analisi NBA")
 page = st.radio("Sezioni", ["🏠 Dashboard", "🎯 Value Finder", "📊 Player Stats"], horizontal=True, label_visibility="collapsed")
 
 # Recupero calendario condiviso; la scansione delle quote avviene SOLO al clic.
@@ -1540,7 +1578,7 @@ elif page == "🎯 Value Finder":
         if not df.empty:
             filtered = get_filtered_frame(saved, odds_min, odds_max, market, minimum_probability)
             st.caption(f"{len(filtered)} selezioni visibili su {len(df)} linee complessive")
-            cols = [c for c in ["Giocatore", "Partita", "Mercato", "Linea", "Quota", "Prob. stimata %", "Ultime 5", "Ultime 10", "Ultime 20", "Partite", "Stagione attuale (n)", "Stagione precedente (n)", "Value stimato %"] if c in filtered.columns]
+            cols = [c for c in ["Giocatore", "Squadra", "Partita", "Mercato", "Linea", "Quota", "Prob. stimata %", "Ultime 5", "Ultime 10", "Ultime 20", "Partite", "Stagione attuale (n)", "Stagione precedente (n)", "Value stimato %"] if c in filtered.columns]
             st.dataframe(filtered[cols], hide_index=True, use_container_width=True, height=490)
             a,b = st.columns(2)
             a.download_button("⬇️ CSV filtrato", csv_excel_friendly(filtered), file_name="nba_stats_3_1_filtrato.csv", mime="text/csv", disabled=filtered.empty, use_container_width=True)
@@ -1570,8 +1608,20 @@ else:
         if not logs:
             st.info("Nessun log ESPN disponibile dalla scansione.")
         else:
-            players = sorted(logs)
-            player = st.selectbox("Giocatore", players)
+            # La squadra deriva dai roster ESPN già scaricati nella scansione; nessuna nuova chiamata API.
+            player_team = {}
+            for item in saved["results"]:
+                name = item.get("Giocatore")
+                team = item.get("Squadra") or "Squadra non identificata"
+                if name in logs:
+                    player_team[name] = team
+            teams = sorted(set(player_team.values()))
+            team_choice = st.selectbox("Squadra", ["Tutte le squadre"] + teams, key="player_team_filter")
+            players = sorted(name for name in logs if team_choice == "Tutte le squadre" or player_team.get(name) == team_choice)
+            if not players:
+                st.info("Nessun giocatore disponibile per questa squadra nella scansione.")
+                st.stop()
+            player = st.selectbox("Giocatore", players, key="player_name_filter")
             stat = st.selectbox("Statistica", ["PTS", "REB", "AST"])
             related = pd.DataFrame(saved["results"])
             related = related[(related["Giocatore"] == player) & (related["Mercato"] == stat)]
