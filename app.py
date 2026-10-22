@@ -9,7 +9,7 @@ import altair as alt
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="NBA STATS 3.6", page_icon="🏀", layout="wide")
+st.set_page_config(page_title="NBA STATS 3.5", page_icon="🏀", layout="wide")
 logger = logging.getLogger("nba_stats_diagnostics")
 BASE = "https://api.oddspapi.io/v4"
 ROME_TZ = ZoneInfo("Europe/Rome")
@@ -1323,17 +1323,11 @@ html, body, [data-testid="stAppViewContainer"], .stApp,
 [data-testid="stMain"], [data-testid="stMainBlockContainer"] {
     background: #0b1220 !important; color: #edf4ff !important;
 }
-/* Header retained for sidebar navigation on desktop and mobile. */
-[data-testid="stHeader"] { background: #0b1220 !important; min-height: 2.6rem !important; }
-#MainMenu, [data-testid="stToolbar"], [data-testid="stDecoration"],
-[data-testid="stFooter"], footer, [data-testid="manage-app-button"],
-[data-testid="stStatusWidget"] { display: none !important; }
+[data-testid="stHeader"] { background: #0b1220 !important; height: 2.6rem !important; }
 [data-testid="stDecoration"] { display: none !important; }
-/* Preserve the sidebar toggle and leave room for the NBA STATS title. */
-.block-container, [data-testid="stMainBlockContainer"] {
-    max-width: 1390px !important;
-    padding: 4rem 2.2rem 3rem !important;
-}
+[data-testid="stToolbar"] { background: transparent !important; }
+/* Manteniamo accessibile il menu di Streamlit, senza mascherare funzionalità di sicurezza. */
+.block-container { max-width: 1390px !important; padding: 1.15rem 2.2rem 3rem !important; }
 [data-testid="stSidebar"], [data-testid="stSidebarContent"] {
     background: #142238 !important; border-right: 1px solid #34445d !important;
 }
@@ -1466,7 +1460,7 @@ h3 { font-size: 1.28rem !important; }
 }
 [data-testid="stRadio"] [role="radiogroup"] label p { color: #f5f9ff !important; }
 @media (max-width: 760px) {
-    .block-container, [data-testid="stMainBlockContainer"] { padding: 3.5rem .9rem 2.5rem !important; }
+    .block-container { padding: 1rem .9rem 2.5rem !important; }
     h1 { font-size: 1.65rem !important; }
 }
 /* NBA STATS 3.4: calendario con testo leggibile, anche nei giorni non selezionati. */
